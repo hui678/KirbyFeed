@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"time"
-
-	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// SocialMQ 负责「关注/取关事件」的发布。
 type SocialMQ struct {
-	ch *amqp.Channel
+	p *publisher
 }
 
 const (
@@ -41,7 +40,19 @@ func NewSocialMQ(base *RabbitMQ) (*SocialMQ, error) {
 		ch.Close()
 		return nil, err
 	}
-	return &SocialMQ{ch: ch}, nil
+	p, err := newPublisher(ch, DefaultConfirmTimeout)
+	if err != nil {
+		ch.Close()
+		return nil, err
+	}
+	return &SocialMQ{p: p}, nil
+}
+
+func (s *SocialMQ) Close() error {
+	if s == nil || s.p == nil {
+		return nil
+	}
+	return s.p.Close()
 }
 
 func (s *SocialMQ) Follow(ctx context.Context, followerID, vloggerID uint) error {
@@ -53,7 +64,7 @@ func (s *SocialMQ) UnFollow(ctx context.Context, followerID, vloggerID uint) err
 }
 
 func (s *SocialMQ) publish(ctx context.Context, action, routingKey string, followerID, vloggerID uint) error {
-	if s == nil || s.ch == nil {
+	if s == nil || s.p == nil {
 		return errors.New("social mq is not initialized")
 	}
 	if followerID == 0 || vloggerID == 0 {
@@ -70,5 +81,5 @@ func (s *SocialMQ) publish(ctx context.Context, action, routingKey string, follo
 		VloggerID:  vloggerID,
 		OccurredAt: time.Now().UTC(),
 	}
-	return PublishJSON(ctx, s.ch, socialExchange, routingKey, evt)
+	return s.p.PublishJSON(ctx, socialExchange, routingKey, evt)
 }

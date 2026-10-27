@@ -2,6 +2,12 @@ package main
 
 import (
 	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
 	mqrabbit "feedsystem_video_go/internal/middleware/rabbitmq"
@@ -10,35 +16,20 @@ import (
 	"feedsystem_video_go/internal/social"
 	"feedsystem_video_go/internal/video"
 	"feedsystem_video_go/internal/worker"
-	"log"
-	"os"
-	"os/signal"
-	"strconv"
-	"syscall"
-	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/joho/godotenv"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"gorm.io/gorm"
 )
 
-const (
-	socialExchange   = "social.events"
-	socialQueue      = "social.events"
-	socialBindingKey = "social.*"
-
-	likeExchange   = "like.events"
-	likeQueue      = "like.events"
-	likeBindingKey = "like.*"
-
-	commentExchange   = "comment.events"
-	commentQueue      = "comment.events"
-	commentBindingKey = "comment.*"
-
-	popularityExchange   = "video.popularity.events"
-	popularityQueue      = "video.popularity.events"
-	popularityBindingKey = "video.popularity.*"
-)
+// 本进程消费的四类事件。拓扑（交换机 / 队列 / 绑定键 / 死信 / 重试队列）统一从
+// rabbitmq 包的 Topic 注册表取，这里只负责把它们装配成 Worker。
+var topics = []mqrabbit.Topic{
+	mqrabbit.LikeTopic,
+	mqrabbit.CommentTopic,
+	mqrabbit.SocialTopic,
+	mqrabbit.PopularityTopic,
+}
 
 func connectWithRetry(name string, maxRetries int, fn func() error) {
 	for i := 0; i < maxRetries; i++ {
@@ -134,39 +125,33 @@ func main() {
 		}
 	}
 	// 连接 RabbitMQ（带重试）
-	url := "amqp://" + cfg.RabbitMQ.Username + ":" + cfg.RabbitMQ.Password + "@" + cfg.RabbitMQ.Host + ":" + strconv.Itoa(cfg.RabbitMQ.Port) + "/"
-	var conn *amqp.Connection
+	var rmq *mqrabbit.RabbitMQ
 	connectWithRetry("RabbitMQ", 10, func() error {
 		var err error
-		conn, err = amqp.Dial(url)
+		rmq, err = mqrabbit.NewRabbitMQ(&cfg.RabbitMQ)
 		return err
 	})
-	defer conn.Close()
+	conn := rmq.Conn
+	defer rmq.Close()
 
-	// 用临时 Channel 声明拓扑（持久化队列，声明一次即可）
-	topoCh, err := conn.Channel()
+	// 声明拓扑：主队列 + 专属死信队列 + 延迟重试队列（关闭后重连的临时 Channel）
+	topoCh, err := rmq.NewChannel()
 	if err != nil {
 		log.Fatalf("Failed to open topology channel: %v", err)
 	}
-	if err := declareSocialTopology(topoCh); err != nil {
-		log.Fatalf("Failed to declare social topology: %v", err)
-	}
-	if err := declareLikeTopology(topoCh); err != nil {
-		log.Fatalf("Failed to declare like topology: %v", err)
-	}
-	if err := declareCommentTopology(topoCh); err != nil {
-		log.Fatalf("Failed to declare comment topology: %v", err)
-	}
-	if cache != nil {
-		if err := declarePopularityTopology(topoCh); err != nil {
-			log.Fatalf("Failed to declare popularity topology: %v", err)
+	for _, t := range topics {
+		if t == mqrabbit.PopularityTopic && cache == nil {
+			// Redis 不可用时热度 Worker 不会启动，也没必要声明它的队列。
+			continue
+		}
+		if err := t.Declare(topoCh, mqrabbit.DefaultRetryTTL); err != nil {
+			log.Fatalf("Failed to declare %s topology: %v", t.Name, err)
 		}
 	}
 	topoCh.Close()
 
 	// 准备 repo
 	socialRepo := social.NewSocialRepository(sqlDB)
-	videoRepo := video.NewVideoRepository(sqlDB)
 	likeRepo := video.NewLikeRepository(sqlDB)
 	commentRepo := video.NewCommentRepository(sqlDB)
 
@@ -185,164 +170,53 @@ func main() {
 		defer pprofServer.Close()
 	}
 
+	// 每类事件一个 RetryRouter：进程内重试耗尽后由它把消息投递到重试队列，
+	// 由 RabbitMQ 的 TTL 完成延迟重投。
+	newRouter := func(t mqrabbit.Topic) worker.RetryPublisher {
+		r, err := mqrabbit.NewRetryRouter(rmq, t.Exchange, t.Queue, mqrabbit.DefaultRetryTTL)
+		if err != nil {
+			log.Printf("Failed to create retry router for %s (退化为直接进入死信): %v", t.Name, err)
+			return nil
+		}
+		return r
+	}
+	likeRetry := newRouter(mqrabbit.LikeTopic)
+	commentRetry := newRouter(mqrabbit.CommentTopic)
+	socialRetry := newRouter(mqrabbit.SocialTopic)
+	popularityRetry := newRouter(mqrabbit.PopularityTopic)
+
 	// 每个 Worker 独立 Channel + 自动重连
-	go runWorkerWithRetry(ctx, "SocialWorker", conn, func(ch *amqp.Channel) error {
-		return worker.NewSocialWorker(ch, socialRepo, socialQueue).Run(ctx)
-	})
 	go runWorkerWithRetry(ctx, "LikeWorker", conn, func(ch *amqp.Channel) error {
-		return worker.NewLikeWorker(ch, likeRepo, videoRepo, likeQueue).Run(ctx)
+		return worker.NewLikeWorker(likeRepo, mqrabbit.LikeTopic.Queue, likeRetry).Run(ctx, ch)
 	})
 	go runWorkerWithRetry(ctx, "CommentWorker", conn, func(ch *amqp.Channel) error {
-		return worker.NewCommentWorker(ch, commentRepo, videoRepo, commentQueue).Run(ctx)
+		return worker.NewCommentWorker(commentRepo, mqrabbit.CommentTopic.Queue, commentRetry).Run(ctx, ch)
+	})
+	go runWorkerWithRetry(ctx, "SocialWorker", conn, func(ch *amqp.Channel) error {
+		return worker.NewSocialWorker(socialRepo, mqrabbit.SocialTopic.Queue, socialRetry).Run(ctx, ch)
 	})
 	if cache != nil {
 		go runWorkerWithRetry(ctx, "PopularityWorker", conn, func(ch *amqp.Channel) error {
-			return worker.NewPopularityWorker(ch, cache, popularityQueue).Run(ctx)
+			return worker.NewPopularityWorker(cache, mqrabbit.PopularityTopic.Queue, popularityRetry).Run(ctx, ch)
+		})
+	}
+
+	// 死信队列消费者：把「重试到上限仍然失败」的消息暴露出来（生产环境应改成告警）。
+	for _, t := range topics {
+		t := t
+		if t == mqrabbit.PopularityTopic && cache == nil {
+			continue
+		}
+		go runWorkerWithRetry(ctx, "DLQWorker-"+t.Name, conn, func(ch *amqp.Channel) error {
+			return worker.NewDLQWorker(t.Queue).Run(ctx, ch)
 		})
 	}
 
 	// 等待退出信号
 	<-ctx.Done()
 	log.Printf("Worker shutting down...")
-	time.Sleep(2 * time.Second) // 等待正在处理的消息完成
+	// 在途消息最长还要经历 1s+2s+4s 的进程内退避重试，给它留出结束的时间；
+	// 没跑完的消息会在 ctx 取消时被 Nack(requeue=true) 退回队列，不会丢。
+	time.Sleep(10 * time.Second)
 	log.Printf("Worker stopped")
-}
-
-func declareSocialTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		socialExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		socialQueue,
-		true,
-		false,
-		false,
-		false,
-		amqp.Table{"x-dead-letter-exchange": mqrabbit.DLXExchange},
-	)
-	if err != nil {
-		return err
-	}
-
-	if err := ch.QueueBind(
-		q.Name,
-		socialBindingKey,
-		socialExchange,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-	return nil
-}
-
-func declarePopularityTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		popularityExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		popularityQueue,
-		true,
-		false,
-		false,
-		false,
-		amqp.Table{"x-dead-letter-exchange": mqrabbit.DLXExchange},
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		popularityBindingKey,
-		popularityExchange,
-		false,
-		nil,
-	)
-}
-
-func declareLikeTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		likeExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		likeQueue,
-		true,
-		false,
-		false,
-		false,
-		amqp.Table{"x-dead-letter-exchange": mqrabbit.DLXExchange},
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		likeBindingKey,
-		likeExchange,
-		false,
-		nil,
-	)
-}
-
-func declareCommentTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		commentExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		commentQueue,
-		true,
-		false,
-		false,
-		false,
-		amqp.Table{"x-dead-letter-exchange": mqrabbit.DLXExchange},
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		commentBindingKey,
-		commentExchange,
-		false,
-		nil,
-	)
 }

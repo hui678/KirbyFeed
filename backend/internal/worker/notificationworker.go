@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"feedsystem_video_go/internal/middleware/rabbitmq"
-	"log"
+	"strings"
 	"time"
+
+	"feedsystem_video_go/internal/middleware/rabbitmq"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Notification struct {
@@ -21,25 +23,31 @@ type Notification struct {
 	Content     string    `gorm:"type:varchar(255)" json:"content"`
 	IsRead      bool      `gorm:"default:false" json:"is_read"`
 	CreatedAt   time.Time `gorm:"autoCreateTime" json:"created_at"`
+	// EventID 是幂等键：通知队列与业务队列绑定在同一个交换机上，消息重投、
+	// 或者 worker 重启后的补投，都会让同一条事件再走一遍。靠唯一索引去重，
+	// 用户才不会收到两条一模一样的「xxx 点赞了你的视频」。
+	// 用指针是为了让历史行的值为 NULL（MySQL 唯一索引允许多个 NULL），
+	// 否则 AutoMigrate 建索引时会被历史空串直接撞上唯一约束。
+	EventID *string `gorm:"uniqueIndex:idx_notification_event_id;size:64" json:"event_id,omitempty"`
 }
 
 type NotificationWorker struct {
-	ch    *amqp.Channel
 	db    *gorm.DB
 	queue string
 	hub   NotificationHub
+	retry RetryPublisher
 }
 
 type NotificationHub interface {
 	Push(userID uint, n *Notification)
 }
 
-func NewNotificationWorker(ch *amqp.Channel, db *gorm.DB, queue string, hub NotificationHub) *NotificationWorker {
-	return &NotificationWorker{ch: ch, db: db, queue: queue, hub: hub}
+func NewNotificationWorker(db *gorm.DB, queue string, hub NotificationHub, retry RetryPublisher) *NotificationWorker {
+	return &NotificationWorker{db: db, queue: queue, hub: hub, retry: retry}
 }
 
-func (w *NotificationWorker) Run(ctx context.Context) error {
-	if w == nil || w.ch == nil || w.db == nil {
+func (w *NotificationWorker) Run(ctx context.Context, ch *amqp.Channel) error {
+	if w == nil || w.db == nil {
 		return errors.New("notification worker is not initialized")
 	}
 	if w.queue == "" {
@@ -48,46 +56,13 @@ func (w *NotificationWorker) Run(ctx context.Context) error {
 	if err := w.db.WithContext(ctx).AutoMigrate(&Notification{}); err != nil {
 		return err
 	}
-	deliveries, err := w.ch.Consume(w.queue, "", false, false, false, false, nil)
-	if err != nil {
-		return err
+	c := &Consumer{
+		Name:    "NotificationWorker",
+		Queue:   w.queue,
+		Retry:   w.retry,
+		Process: w.process,
 	}
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case d, ok := <-deliveries:
-			if !ok {
-				return errors.New("deliveries channel closed")
-			}
-			w.handleDelivery(ctx, d)
-		}
-	}
-}
-
-func (w *NotificationWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
-	const maxRetries = 3
-	for i := 0; i <= maxRetries; i++ {
-		select {
-		case <-ctx.Done():
-			_ = d.Nack(false, true)
-			return
-		default:
-		}
-		if err := w.process(ctx, d); err != nil {
-			if i >= maxRetries {
-				log.Printf("notification worker: 重试 %d 次后仍失败, 丢弃: %v", maxRetries, err)
-				_ = d.Ack(false)
-				return
-			}
-			wait := time.Duration(1<<uint(i)) * time.Second
-			log.Printf("notification worker: 处理失败, %v 后重试 (%d/%d): %v", wait, i+1, maxRetries, err)
-			time.Sleep(wait)
-			continue
-		}
-		_ = d.Ack(false)
-		return
-	}
+	return c.Run(ctx, ch)
 }
 
 func (w *NotificationWorker) process(ctx context.Context, d amqp.Delivery) error {
@@ -98,6 +73,7 @@ func (w *NotificationWorker) process(ctx context.Context, d amqp.Delivery) error
 	routingKey := d.RoutingKey
 
 	var notif *Notification
+	var eventID string
 
 	switch {
 	case routingKey == "like.like":
@@ -108,6 +84,7 @@ func (w *NotificationWorker) process(ctx context.Context, d amqp.Delivery) error
 		if evt.UserID == 0 || evt.VideoID == 0 {
 			return nil
 		}
+		eventID = evt.EventID
 		var authorID uint
 		if err := w.db.WithContext(ctx).Model(&struct {
 			ID       uint
@@ -128,6 +105,7 @@ func (w *NotificationWorker) process(ctx context.Context, d amqp.Delivery) error
 		if evt.AuthorID == 0 || evt.VideoID == 0 {
 			return nil
 		}
+		eventID = evt.EventID
 		var authorID uint
 		if err := w.db.WithContext(ctx).Model(&struct {
 			ID       uint
@@ -148,14 +126,25 @@ func (w *NotificationWorker) process(ctx context.Context, d amqp.Delivery) error
 		if evt.FollowerID == 0 || evt.VloggerID == 0 {
 			return nil
 		}
+		eventID = evt.EventID
 		notif = &Notification{RecipientID: evt.VloggerID, SenderID: evt.FollowerID, Type: "follow", TargetID: evt.FollowerID, Content: "关注了你"}
 	}
 
 	if notif == nil {
 		return nil
 	}
-	if err := w.db.WithContext(ctx).Create(notif).Error; err != nil {
-		return err
+	if eid := strings.TrimSpace(eventID); eid != "" {
+		notif.EventID = &eid
+	}
+
+	// 幂等插入：同一条事件重复投递时 RowsAffected=0，直接返回，
+	// 不再重复推送 SSE（否则用户会看到两条一样的通知）。
+	res := w.db.WithContext(ctx).Clauses(clause.Insert{Modifier: "IGNORE"}).Create(notif)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return nil
 	}
 	if w.hub != nil {
 		w.hub.Push(notif.RecipientID, notif)

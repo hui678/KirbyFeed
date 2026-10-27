@@ -22,7 +22,12 @@ const router = createRouter({
     { path: '/video/:id', name: 'video-detail', component: VideoDetailView, props: true },
     { path: '/account', name: 'account', component: AccountView },
     { path: '/account/register', name: 'account-register', component: RegisterView },
-    { path: '/account/change-password', name: 'account-change-password', component: ChangePasswordView },
+    {
+      path: '/account/change-password',
+      name: 'account-change-password',
+      component: ChangePasswordView,
+      meta: { requiresAuth: true }, // 改密接口已改为登录态，页面守卫必须同步
+    },
     { path: '/settings', name: 'settings', component: SettingsView, meta: { requiresAuth: true } },
     { path: '/u/:id', name: 'user-profile', component: UserProfileView, props: true },
     { path: '/messages', name: 'message-list', component: MessageView, meta: { requiresAuth: true } },

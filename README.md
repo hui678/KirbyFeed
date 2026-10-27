@@ -31,7 +31,7 @@ docker compose up -d --build
 - 后端 API：`http://localhost:8080`
 - RabbitMQ 管理台：`http://localhost:15672`（`admin` / `password123`）
 
-Docker Compose 会读取 `.env`，缺省使用 `feedsystem-dev-secret-key`。生产环境请修改 `JWT_SECRET`。
+Docker Compose 会读取 `.env`，`JWT_SECRET` 缺省值仅供本地开发。生产环境必须显式设置；未设置时后端会启动失败（不会随机生成密钥，否则重启后所有 token 失效、多实例之间互不认账）。
 
 ## 脚本启动
 
@@ -81,7 +81,7 @@ GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Pull Request 以及
 | POST | `/register` | 否 | 注册（限流 5次/时/IP） |
 | POST | `/login` | 否 | 登录，返回 access_token + refresh_token |
 | POST | `/refresh` | 否 | 刷新 access_token（用 refresh_token） |
-| POST | `/changePassword` | 否 | 改密码（需旧密码） |
+| POST | `/changePassword` | JWT | 改密码（需旧密码，限流 5次/时/账号，成功后吊销双 token） |
 | POST | `/findByID` | 否 | 按 ID 查用户 |
 | POST | `/findByUsername` | 否 | 按用户名查 |
 | POST | `/getProfile` | 否 | 用户主页（视频数/获赞/粉丝数） |
@@ -154,7 +154,7 @@ GitHub Actions 配置位于 `.github/workflows/ci.yml`，在 Pull Request 以及
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `JWT_SECRET` | `feedsystem-dev-secret-key` | JWT 签名密钥，生产须改 |
+| `JWT_SECRET` | 无（缺失时后端启动失败） | JWT 签名密钥，长度建议 ≥ 32 字节；compose 里的默认值仅供本地，生产必须覆盖 |
 | `SERVER_PORT` | `8080` | 后端监听端口 |
 | `MYSQL_HOST` / `MYSQL_PORT` | 配置文件值 | MySQL 地址 |
 | `MYSQL_USER` / `MYSQL_PASSWORD` | 配置文件值 | MySQL 账号密码 |

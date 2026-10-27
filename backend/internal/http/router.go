@@ -35,6 +35,8 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	likeLimiter := ratelimit.Limit(cache, "like_write", 30, time.Minute, ratelimit.KeyByAccount)
 	commentLimiter := ratelimit.Limit(cache, "comment_write", 10, time.Minute, ratelimit.KeyByAccount)
 	socialLimiter := ratelimit.Limit(cache, "social_write", 20, time.Minute, ratelimit.KeyByAccount)
+	// 改密按账号限流：即使已经要求登录态，也要挡住对旧密码的反复尝试
+	changePwdLimiter := ratelimit.Limit(cache, "account_change_password", 5, time.Hour, ratelimit.KeyByAccount)
 
 	// account
 	accountRepository := account.NewAccountRepository(db)
@@ -44,7 +46,6 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	{
 		accountGroup.POST("/register", registerLimiter, accountHandler.CreateAccount)
 		accountGroup.POST("/login", loginLimiter, accountHandler.Login)
-		accountGroup.POST("/changePassword", accountHandler.ChangePassword)
 		accountGroup.POST("/findByID", accountHandler.FindByID)
 		accountGroup.POST("/findByUsername", accountHandler.FindByUsername)
 		accountGroup.POST("/refresh", accountHandler.Refresh)
@@ -53,12 +54,15 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	protectedAccountGroup.Use(jwt.JWTAuth(accountRepository, cache))
 	{
 		protectedAccountGroup.POST("/logout", accountHandler.Logout)
+		// 改密必须在登录态下调用（旧实现放在匿名组，任何人知道用户名就能试旧密码）
+		protectedAccountGroup.POST("/changePassword", changePwdLimiter, accountHandler.ChangePassword)
 		protectedAccountGroup.POST("/rename", accountHandler.Rename)
 		protectedAccountGroup.POST("/uploadAvatar", accountHandler.UploadAvatar)
 		protectedAccountGroup.POST("/updateProfile", accountHandler.UpdateProfile)
 	}
 	// video
 	videoRepository := video.NewVideoRepository(db)
+	outboxRepository := video.NewOutboxRepository(db)
 	popularityMQ, err := rabbitmq.NewPopularityMQ(rmq)
 	if err != nil {
 		log.Printf("PopularityMQ init failed (mq disabled): %v", err)
@@ -170,6 +174,8 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	feedRepository := feed.NewFeedRepository(db)
 	feedService := feed.NewFeedService(feedRepository, likeRepository, cache)
 	feedHandler := feed.NewFeedHandler(feedService)
+	// 热榜快照后台预生成：把「合并 60 个分钟桶」这个 O(N) 阻塞命令从读请求路径上挪走。
+	feed.StartHotSnapshotBuilder(context.Background(), feedService, time.Minute)
 	feedGroup := r.Group("/feed")
 	feedGroup.Use(jwt.SoftJWTAuth(accountRepository, cache))
 	{
@@ -194,31 +200,77 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 		protectedMessageGroup.POST("/send", messageHandler.Send)
 		protectedMessageGroup.POST("/list", messageHandler.List)
 	}
-	//worker
-	timelineMQ, err := rabbitmq.NewTimelineMQ(rmq)
-	if err != nil {
-		log.Printf("timelineMQ init failed (mq disabled): %v", err)
-		timelineMQ = nil
+	//worker：Outbox 投递 + 时间线消费。
+	// 两者都自带重连/自愈，MQ 未就绪时不再永久退出，恢复后自动补发积压消息。
+	workerCtx := context.Background()
+
+	// 时间线队列同样需要重试队列 + 死信队列：Outbox 保证的是"至少一次投递"，
+	// 如果消费端失败后直接 Ack 丢弃，前面所有可靠性设计都在最后一环作废。
+	var timelineRetry worker.RetryPublisher
+	if rmq != nil {
+		if tlCh, err := rmq.NewChannel(); err == nil {
+			if err := rabbitmq.TimelineTopic.Declare(tlCh, rabbitmq.DefaultRetryTTL); err != nil {
+				log.Printf("timeline topology init failed: %v", err)
+			}
+			tlCh.Close()
+		}
+		router, err := rabbitmq.NewRetryRouter(rmq,
+			rabbitmq.TimelineTopic.Exchange, rabbitmq.TimelineTopic.Queue, rabbitmq.DefaultRetryTTL)
+		if err != nil {
+			log.Printf("timeline retry router init failed: %v", err)
+		} else {
+			timelineRetry = router
+		}
 	}
-	worker.StartOutboxPoller(db, timelineMQ)
-	worker.StartConsumer(timelineMQ, "video.timeline.update.queue", cache, rmq)
+
+	worker.StartOutboxPoller(workerCtx, outboxRepository, rmq)
+	worker.StartConsumer(workerCtx, rmq, rabbitmq.TimelineTopic.Queue, cache, timelineRetry)
+
+	// 死信队列也要有人消费，否则它只是把失败消息挪了个地方、仍然没人知道。
+	// 这几个队列的消费者都在 API 进程内，所以它们的死信消费者也在这里启动。
+	startDLQConsumers(workerCtx, rmq, []string{
+		rabbitmq.TimelineTopic.Queue,
+		"notification.like",
+		"notification.comment",
+		"notification.social",
+	})
 
 	// SSE notification
+	// 通知队列与业务队列绑定在**同一个交换机**上：一次事件、多份消费（落库一份、通知一份）。
+	// 因此它们同样需要各自的重试队列和死信队列，否则通知处理失败会被静默丢弃。
+	notifTopics := []struct {
+		exchange string
+		queue    string
+		binding  string
+	}{
+		{"like.events", "notification.like", "like.like"},
+		{"comment.events", "notification.comment", "comment.publish"},
+		{"social.events", "notification.social", "social.follow"},
+	}
+	notifRetry := map[string]worker.RetryPublisher{}
 	if rmq != nil {
 		if notifCh, err := rmq.NewChannel(); err == nil {
-			if err := rabbitmq.DeclareTopic(notifCh, "like.events", "notification.like", "like.like"); err != nil {
-				log.Printf("notification like topic init failed: %v", err)
-			}
-			if err := rabbitmq.DeclareTopic(notifCh, "comment.events", "notification.comment", "comment.publish"); err != nil {
-				log.Printf("notification comment topic init failed: %v", err)
-			}
-			if err := rabbitmq.DeclareTopic(notifCh, "social.events", "notification.social", "social.follow"); err != nil {
-				log.Printf("notification social topic init failed: %v", err)
+			for _, t := range notifTopics {
+				if err := rabbitmq.DeclareTopic(notifCh, t.exchange, t.queue, t.binding); err != nil {
+					log.Printf("notification topic init failed (%s): %v", t.queue, err)
+					continue
+				}
+				if err := rabbitmq.DeclareRetry(notifCh, t.exchange, t.queue, rabbitmq.DefaultRetryTTL); err != nil {
+					log.Printf("notification retry topology init failed (%s): %v", t.queue, err)
+				}
 			}
 			notifCh.Close()
 		}
+		for _, t := range notifTopics {
+			router, err := rabbitmq.NewRetryRouter(rmq, t.exchange, t.queue, rabbitmq.DefaultRetryTTL)
+			if err != nil {
+				log.Printf("notification retry router init failed (%s): %v", t.queue, err)
+				continue
+			}
+			notifRetry[t.queue] = router
+		}
 	}
-	sseHub := worker.NewSSEHub(db)
+	sseHub := worker.NewSSEHub(db, cache, accountRepository)
 	notifGroup := r.Group("/notification")
 	notifGroup.Use(sseHub.SSERequireAuth())
 	sseHub.RegisterRoutes(r, notifGroup)
@@ -237,8 +289,11 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 							time.Sleep(5 * time.Second)
 							continue
 						}
-						w := worker.NewNotificationWorker(ch, db, queue, hub)
-						if err := w.Run(ctx); err != nil {
+						if err := ch.Qos(50, 0, false); err != nil {
+							log.Printf("notification-%s: QoS 设置失败: %v", queue, err)
+						}
+						w := worker.NewNotificationWorker(db, queue, hub, notifRetry[queue])
+						if err := w.Run(ctx, ch); err != nil {
 							log.Printf("notification-%s: %v, 5秒后重连...", queue, err)
 						}
 						ch.Close()
@@ -252,4 +307,41 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	}()
 
 	return r
+}
+
+// startDLQConsumers 为「在 API 进程内消费」的队列启动死信消费者。
+//
+// 死信队列只做「记录 + 告警」，不重新投递：能走到这里的消息已经经历了进程内退避重试
+// 和多轮 TTL 延迟重投，继续 requeue 只会让一条注定失败的消息反复冲击数据库。
+// 不启动它的话，死信队列只是把失败消息挪了个地方，仍然没有任何人知道。
+func startDLQConsumers(ctx context.Context, rmq *rabbitmq.RabbitMQ, mainQueues []string) {
+	if rmq == nil {
+		return
+	}
+	for _, q := range mainQueues {
+		go func(mainQueue string) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				ch, err := rmq.NewChannel()
+				if err != nil {
+					log.Printf("dlq-%s: 创建 Channel 失败: %v, 5秒后重试", mainQueue, err)
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				if err := worker.NewDLQWorker(mainQueue).Run(ctx, ch); err != nil {
+					if ctx.Err() != nil {
+						ch.Close()
+						return
+					}
+					log.Printf("dlq-%s: %v, 5秒后重连...", mainQueue, err)
+				}
+				ch.Close()
+				time.Sleep(5 * time.Second)
+			}
+		}(q)
+	}
 }

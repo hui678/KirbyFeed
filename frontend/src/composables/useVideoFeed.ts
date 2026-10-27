@@ -14,6 +14,7 @@ export function useVideoFeed() {
     items: [] as FeedVideoItem[],
     loading: false, error: '',
     hasMore: false, nextTime: 0,
+    nextIdBefore: undefined as number | undefined,
   })
 
   const hot = reactive({
@@ -28,6 +29,7 @@ export function useVideoFeed() {
     items: [] as FeedVideoItem[],
     loading: false, error: '',
     hasMore: false, nextTime: 0,
+    nextIdBefore: undefined as number | undefined,
   })
 
   const currentState = computed(() => {
@@ -41,9 +43,14 @@ export function useVideoFeed() {
     recommend.loading = true
     recommend.error = ''
     try {
-      const res = await feedApi.listLatest({ limit: 10, latest_time: reset ? 0 : recommend.nextTime })
+      const res = await feedApi.listLatest({
+        limit: 10,
+        latest_time: reset ? 0 : recommend.nextTime,
+        latest_id_before: reset ? undefined : recommend.nextIdBefore,
+      })
       recommend.hasMore = res.has_more
       recommend.nextTime = res.next_time
+      recommend.nextIdBefore = res.next_id_before
       recommend.items = reset ? res.video_list : recommend.items.concat(res.video_list)
     } catch (e) {
       recommend.error = e instanceof ApiError ? e.message : String(e)
@@ -82,9 +89,14 @@ export function useVideoFeed() {
     following.loading = true
     following.error = ''
     try {
-      const res = await feedApi.listByFollowing({ limit: 10, latest_time: reset ? 0 : following.nextTime })
+      const res = await feedApi.listByFollowing({
+        limit: 10,
+        latest_time: reset ? 0 : following.nextTime,
+        latest_id_before: reset ? undefined : following.nextIdBefore,
+      })
       following.hasMore = res.has_more
       following.nextTime = res.next_time
+      following.nextIdBefore = res.next_id_before
       following.items = reset ? res.video_list : following.items.concat(res.video_list)
     } catch (e) {
       following.error = e instanceof ApiError ? e.message : String(e)

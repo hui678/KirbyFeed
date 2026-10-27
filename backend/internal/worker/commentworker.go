@@ -4,88 +4,47 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
+
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/video"
-	"log"
-	"strings"
-	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// CommentWorker 消费「评论落库事件」。
+// 幂等靠 comments.event_id 唯一索引：消息重复投递时 INSERT IGNORE 的 RowsAffected
+// 为 0，直接返回，不会产生第二条评论。
 type CommentWorker struct {
-	ch       *amqp.Channel
 	comments *video.CommentRepository
-	videos   *video.VideoRepository
 	queue    string
+	retry    RetryPublisher
 }
 
-func NewCommentWorker(ch *amqp.Channel, comments *video.CommentRepository, videos *video.VideoRepository, queue string) *CommentWorker {
-	return &CommentWorker{ch: ch, comments: comments, videos: videos, queue: queue}
+func NewCommentWorker(comments *video.CommentRepository, queue string, retry RetryPublisher) *CommentWorker {
+	return &CommentWorker{comments: comments, queue: queue, retry: retry}
 }
 
-func (w *CommentWorker) Run(ctx context.Context) error {
-	if w == nil || w.ch == nil || w.comments == nil || w.videos == nil {
+func (w *CommentWorker) Run(ctx context.Context, ch *amqp.Channel) error {
+	if w == nil || w.comments == nil {
 		return errors.New("comment worker is not initialized")
 	}
 	if w.queue == "" {
 		return errors.New("queue is required")
 	}
-
-	deliveries, err := w.ch.Consume(
-		w.queue,
-		"",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
+	c := &Consumer{
+		Name:    "CommentWorker",
+		Queue:   w.queue,
+		Retry:   w.retry,
+		Process: w.process,
 	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case d, ok := <-deliveries:
-			if !ok {
-				return errors.New("deliveries channel closed")
-			}
-			w.handleDelivery(ctx, d)
-		}
-	}
+	return c.Run(ctx, ch)
 }
 
-func (w *CommentWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
-	const maxRetries = 3
-	for i := 0; i <= maxRetries; i++ {
-		select {
-		case <-ctx.Done():
-			_ = d.Nack(false, true)
-			return
-		default:
-		}
-		if err := w.process(ctx, d.Body); err != nil {
-			if i >= maxRetries {
-				log.Printf("comment worker: 重试 %d 次后仍失败, 丢弃: %v", maxRetries, err)
-				_ = d.Ack(false)
-				return
-			}
-			wait := time.Duration(1<<uint(i)) * time.Second
-			log.Printf("comment worker: 处理失败, %v 后重试 (%d/%d): %v", wait, i+1, maxRetries, err)
-			time.Sleep(wait)
-			continue
-		}
-		_ = d.Ack(false)
-		return
-	}
-}
-
-func (w *CommentWorker) process(ctx context.Context, body []byte) error {
+func (w *CommentWorker) process(ctx context.Context, d amqp.Delivery) error {
 	var evt rabbitmq.CommentEvent
-	if err := json.Unmarshal(body, &evt); err != nil {
+	if err := json.Unmarshal(d.Body, &evt); err != nil {
+		// 坏消息，重试无意义
 		return nil
 	}
 	switch evt.Action {
@@ -103,36 +62,23 @@ func (w *CommentWorker) applyPublish(ctx context.Context, evt *rabbitmq.CommentE
 		return nil
 	}
 
-	ok, err := w.videos.IsExist(ctx, evt.VideoID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
-
 	c := &video.Comment{
 		Username: strings.TrimSpace(evt.Username),
 		VideoID:  evt.VideoID,
 		AuthorID: evt.AuthorID,
 		Content:  strings.TrimSpace(evt.Content),
 	}
-	if err := w.comments.CreateComment(ctx, c); err != nil {
-		return err
+	// 幂等键：没有 event_id 的旧消息退化为「不去重」，但不会报错。
+	if eid := strings.TrimSpace(evt.EventID); eid != "" {
+		c.EventID = &eid
 	}
-	return w.videos.ChangePopularity(ctx, evt.VideoID, 1)
+	return w.comments.ApplyPublish(ctx, c)
 }
 
 func (w *CommentWorker) applyDelete(ctx context.Context, evt *rabbitmq.CommentEvent) error {
 	if evt == nil || evt.CommentID == 0 {
 		return nil
 	}
-	c, err := w.comments.GetByID(ctx, evt.CommentID)
-	if err != nil {
-		return err
-	}
-	if c == nil {
-		return nil
-	}
-	return w.comments.DeleteComment(ctx, c)
+	// 删除天然幂等：行已经不在就什么都不做。
+	return w.comments.ApplyDelete(ctx, evt.CommentID)
 }

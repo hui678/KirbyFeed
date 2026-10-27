@@ -17,13 +17,28 @@ func NewFeedRepository(db *gorm.DB) *FeedRepository {
 	return &FeedRepository{db: db}
 }
 
-func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBefore time.Time) ([]*video.Video, error) {
+// ListLatest 按 (create_time DESC, id DESC) 取一页视频。
+//
+// 两处必须成对存在，缺一不可：
+//  1. ORDER BY 里必须有 id 作为次级键 —— 否则相同 create_time 的行之间没有稳定顺序，
+//     相邻两页的相对次序可能变化，造成重复或漏项。
+//  2. WHERE 必须用复合比较而不是 create_time < ? —— 否则游标所在那一毫秒的其他视频会被整体跳过。
+//
+// InnoDB 二级索引尾部自动带上主键，idx_videos_create_time 实际是 (create_time, id)，
+// 所以这组 ORDER BY + WHERE 可以完整走索引，不需要新建索引。
+func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, cursor *TimelineCursor) ([]*video.Video, error) {
 	var videos []*video.Video
 	query := repo.db.WithContext(ctx).Model(&video.Video{}).
-		Order("create_time DESC")
-	if !latestBefore.IsZero() {
-		query = query.Where("create_time < ?", latestBefore)
+		Order("create_time DESC, id DESC")
+
+	if cursor != nil {
+		query = query.Where(
+			"(create_time < ?) OR (create_time = ? AND id < ?)",
+			cursor.CreateTime,
+			cursor.CreateTime, cursor.ID,
+		)
 	}
+
 	if err := query.Limit(limit).Find(&videos).Error; err != nil {
 		return nil, err
 	}
@@ -49,10 +64,11 @@ func (repo *FeedRepository) ListLikesCountWithCursor(ctx context.Context, limit 
 	return videos, nil
 }
 
-func (repo *FeedRepository) ListByFollowing(ctx context.Context, limit int, viewerAccountID uint, latestBefore time.Time) ([]*video.Video, error) {
+// ListByFollowing 与 ListLatest 共用同一套复合游标语义，理由见 ListLatest 注释。
+func (repo *FeedRepository) ListByFollowing(ctx context.Context, limit int, viewerAccountID uint, cursor *TimelineCursor) ([]*video.Video, error) {
 	var videos []*video.Video
 	query := repo.db.WithContext(ctx).Model(&video.Video{}).
-		Order("create_time DESC")
+		Order("create_time DESC, id DESC")
 	if viewerAccountID > 0 {
 		followingSubQuery := repo.db.WithContext(ctx).
 			Model(&social.Social{}).
@@ -60,8 +76,12 @@ func (repo *FeedRepository) ListByFollowing(ctx context.Context, limit int, view
 			Where("follower_id = ?", viewerAccountID)
 		query = query.Where("author_id IN (?)", followingSubQuery)
 	}
-	if !latestBefore.IsZero() {
-		query = query.Where("create_time < ?", latestBefore)
+	if cursor != nil {
+		query = query.Where(
+			"(create_time < ?) OR (create_time = ? AND id < ?)",
+			cursor.CreateTime,
+			cursor.CreateTime, cursor.ID,
+		)
 	}
 	if err := query.Limit(limit).Find(&videos).Error; err != nil {
 		return nil, err

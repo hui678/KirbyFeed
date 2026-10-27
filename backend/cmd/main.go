@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"feedsystem_video_go/internal/auth"
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
 	apphttp "feedsystem_video_go/internal/http"
@@ -18,7 +19,7 @@ import (
 
 func main() {
 	// 加载 .env（本地开发）
-	if err := godotenv.Load(); err != nil { 
+	if err := godotenv.Load(); err != nil {
 		log.Println(".env not found; continuing")
 	}
 
@@ -38,6 +39,12 @@ func main() {
 		log.Printf("Config loaded from file: %s", configPath)
 	}
 
+	// 鉴权密钥：缺失直接启动失败。
+	// 旧实现会随机生成一把，导致重启后 token 全失效、多实例之间互不认账。
+	if err := auth.Init(); err != nil {
+		log.Fatalf("JWT 配置非法，请设置环境变量 JWT_SECRET: %v", err)
+	}
+
 	// 连接数据库
 	//log.Printf("Database config: %v", cfg.Database)
 	// 连接数据库（自己封装的函数）
@@ -49,7 +56,7 @@ func main() {
 	if err := db.AutoMigrate(sqlDB); err != nil {
 		log.Fatalf("Failed to auto migrate database: %v", err)
 	}
-	defer db.CloseDB(sqlDB)// 关闭数据库连接（自己封装的函数）
+	defer db.CloseDB(sqlDB) // 关闭数据库连接（自己封装的函数）
 
 	// 连接 Redis (可选，用于缓存)
 	cache, err := rediscache.NewFromEnv(&cfg.Redis)

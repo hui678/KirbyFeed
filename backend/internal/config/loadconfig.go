@@ -21,12 +21,45 @@ type ServerConfig struct {
 	Port int `yaml:"port"`
 }
 
+// 数据库连接池的默认值。
+//
+// MaxOpenConns 必须显式设置：GORM 默认 MaxOpenConns = 0（无上限），缓存雪崩
+// 或数据库变慢时会一路新建连接，直到打满 MySQL 的 max_connections —— 那会让
+// 所有查询一起失败，包括本来能成功的那些。设了上限后，超出部分在应用侧排队
+// 或失败，MySQL 自身仍然可用，这是最后一道、也是谁都绕不过去的硬闸门。
+//
+// DefaultMaxConcurrentDBLoad 是 Feed 回源闸门的容量，取连接池上限的一半：
+// 连接池还要留给写路径、事务、迁移以及 social / video / like 等其他包的查询，
+// 回源闸门只能占用其中一部分，不能吃满。
+const (
+	DefaultMaxOpenConns = 64
+	DefaultMaxIdleConns = 16
+
+	DefaultMaxConcurrentDBLoad = DefaultMaxOpenConns / 2
+)
+
 type DatabaseConfig struct {
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	DBName   string `yaml:"dbname"`
+	// MaxOpenConns / MaxIdleConns 为 0 时用上面的默认值。见 DefaultMaxOpenConns 的说明。
+	MaxOpenConns int `yaml:"max_open_conns"`
+	MaxIdleConns int `yaml:"max_idle_conns"`
+}
+
+// Normalize 把未配置的字段填成默认值，并修正 idle > open 这种非法组合。
+func (c *DatabaseConfig) Normalize() {
+	if c.MaxOpenConns <= 0 {
+		c.MaxOpenConns = DefaultMaxOpenConns
+	}
+	if c.MaxIdleConns <= 0 {
+		c.MaxIdleConns = DefaultMaxIdleConns
+	}
+	if c.MaxIdleConns > c.MaxOpenConns {
+		c.MaxIdleConns = c.MaxOpenConns
+	}
 }
 
 type RedisConfig struct {
@@ -96,6 +129,16 @@ func ApplyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("MYSQL_DATABASE"); v != "" {
 		cfg.Database.DBName = v
 	}
+	if v := os.Getenv("MYSQL_MAX_OPEN_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Database.MaxOpenConns = n
+		}
+	}
+	if v := os.Getenv("MYSQL_MAX_IDLE_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Database.MaxIdleConns = n
+		}
+	}
 	if v := os.Getenv("REDIS_HOST"); v != "" {
 		cfg.Redis.Host = v
 	}
@@ -126,6 +169,9 @@ func ApplyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("RABBITMQ_PASS"); v != "" {
 		cfg.RabbitMQ.Password = v
 	}
+
+	// 无论走 YAML 还是默认值，连接池参数都要保证有值（见 DefaultMaxOpenConns 的说明）
+	cfg.Database.Normalize()
 }
 
 // bool用来表示是否使用了默认配置，true表示使用了默认配置

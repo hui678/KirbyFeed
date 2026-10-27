@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"time"
-
-	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// LikeMQ 负责「点赞落库事件」的发布。
+// Channel 开启了 publisher confirm：publish 返回 nil 才代表 broker 已确认收下，
+// 服务层据此决定「走异步」还是「降级直写」。
 type LikeMQ struct {
-	ch *amqp.Channel
+	p *publisher
 }
 
 const (
@@ -41,7 +42,19 @@ func NewLikeMQ(base *RabbitMQ) (*LikeMQ, error) {
 		ch.Close()
 		return nil, err
 	}
-	return &LikeMQ{ch: ch}, nil
+	p, err := newPublisher(ch, DefaultConfirmTimeout)
+	if err != nil {
+		ch.Close()
+		return nil, err
+	}
+	return &LikeMQ{p: p}, nil
+}
+
+func (l *LikeMQ) Close() error {
+	if l == nil || l.p == nil {
+		return nil
+	}
+	return l.p.Close()
 }
 
 func (l *LikeMQ) Like(ctx context.Context, userID, videoID uint) error {
@@ -53,7 +66,7 @@ func (l *LikeMQ) Unlike(ctx context.Context, userID, videoID uint) error {
 }
 
 func (l *LikeMQ) publish(ctx context.Context, action, routingKey string, userID, videoID uint) error {
-	if l == nil || l.ch == nil {
+	if l == nil || l.p == nil {
 		return errors.New("like mq is not initialized")
 	}
 	if userID == 0 || videoID == 0 {
@@ -70,5 +83,5 @@ func (l *LikeMQ) publish(ctx context.Context, action, routingKey string, userID,
 		VideoID:    videoID,
 		OccurredAt: time.Now(),
 	}
-	return PublishJSON(ctx, l.ch, likeExchange, routingKey, event)
+	return l.p.PublishJSON(ctx, likeExchange, routingKey, event)
 }

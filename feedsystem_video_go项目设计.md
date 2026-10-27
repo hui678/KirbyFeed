@@ -169,8 +169,7 @@
 | 分片上传索引            | STRING   | `chunk_upload_hash:<accountID>:<fileHash>`        | `uploadID`                        | 24h           | 同一用户同一文件 hash 可复用上传会话。                        |
 | Feed 全局时间线         | ZSET     | `feed:global_timeline`                            | member=`videoID` score=`createTime(ms)` | 常驻/修剪 | Outbox + TimelineConsumer 写入；保留最近约 1000 条热数据。    |
 | Feed 关注流缓存         | STRING   | `feed:listByFollowing:limit=<n>:accountID=<id>:before=<u>` | `ListByFollowingResponse`（JSON） | 24h | 使用 `lock:<cacheKey>` 互斥回源；关注流读多写少场景加速。     |
-| 视频实体缓存            | STRING   | `video:entity:<videoID>`                          | `Video`（JSON）                   | 1h            | Feed 批量取详情使用 L1 本地缓存 5s + L2 Redis + L3 MySQL。     |
-| 视频详情缓存            | STRING   | `video:detail:id=<videoID>`                       | `Video`（JSON）                   | 5m            | **一致性**：视频删除/更新时主动 `DEL`；**防击穿**：详情回源可加互斥锁（如 2s 锁 TTL）。 |
+| 视频实体缓存            | STRING   | `video:entity:<videoID>`                          | `Video`（JSON）                   | 1h            | 详情页与 Feed 共用同一份实体缓存，key 与 TTL 由 `video/video_cache.go` 统一维护；Feed 侧为 L1 本地缓存 5s + L2 Redis + L3 MySQL，**一致性**：视频删除/热度变化时主动 `DEL`，**防击穿**：singleflight —— 详情页与 Feed 侧**共用同一个回源去重组 `video.EntityLoadGroup`**（`video/video_cache.go`），两条路径的并发请求会合并为一次回源。
 | 实时热榜窗              | ZSET     | `hot:video:1m:<yyyyMMddHHmm>`                     | member=`videoID` score=`热度增量` | 2h            | **滚动窗口**：按分钟分桶写入；用 `ZINCRBY` 更新热度，减少单 Key 竞争。 |
 | 热榜快照                | ZSET     | `hot:video:merge:1m:<as_of>`                      | `ZUNIONSTORE` 合并结果            | 2m            | **聚合查询**：合并最近 60 个分钟窗生成快照；快照分页读取，保证分页一致性与稳定性。 |
 | 接口限流计数            | STRING   | `feedsystem:ratelimit:<scope>:<subject>`          | 计数值                            | 窗口 TTL      | 登录 10次/分钟/IP；注册 5次/小时/IP；点赞 30次/分钟/账号；评论 10次/分钟/账号；关注 20次/分钟/账号。 |

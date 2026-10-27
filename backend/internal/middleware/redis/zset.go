@@ -79,3 +79,25 @@ func (c *Client) ZRevRangeByScore(ctx context.Context, key string, max, min stri
 		Count:  count,
 	}).Result()
 }
+
+// ZCount 统计 [min, max] 区间内的成员数，用于计算某个 score 上有多少条重复数据
+func (c *Client) ZCount(ctx context.Context, key string, min, max string) (int64, error) {
+	if c == nil || c.rdb == nil {
+		return 0, errors.New("redis client not initialized")
+	}
+	return c.rdb.ZCount(ctx, key, min, max).Result()
+}
+
+// ZRevRangeByScoreWithScores 与 ZRevRangeByScore 相同，但一并返回 score。
+// 时间线游标需要 (score, member) 两个值才能做复合游标，光有 member 不够。
+func (c *Client) ZRevRangeByScoreWithScores(ctx context.Context, key string, max, min string, offset, count int64) ([]redis.Z, error) {
+	if c == nil || c.rdb == nil {
+		return nil, errors.New("redis client not initialized")
+	}
+	return c.rdb.ZRevRangeByScoreWithScores(ctx, key, &redis.ZRangeBy{
+		Max:    max,
+		Min:    min,
+		Offset: offset,
+		Count:  count,
+	}).Result()
+}

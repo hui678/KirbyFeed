@@ -9,8 +9,6 @@ import (
 	"log"
 	"regexp"
 	"strings"
-
-	"gorm.io/gorm"
 )
 
 type CommentService struct {
@@ -46,15 +44,33 @@ func (s *CommentService) Publish(ctx context.Context, comment *Comment) error {
 		return errors.New("video not found")
 	}
 
+	// 幂等键在发布前就生成：无论最终走 MQ 还是降级直写，都写进 comments.event_id。
+	// 这样「publish 成功但 confirm 超时 → 降级又写一次」这个窗口下，
+	// 消费端的唯一索引能把第二次插入挡掉，不会出现两条一模一样的评论。
+	if comment.EventID == nil {
+		if eventID, err := rabbitmq.NewEventID(); err == nil && eventID != "" {
+			comment.EventID = &eventID
+		}
+	}
+
 	mysqlEnqueued := false
 	redisEnqueued := false
 	if s.commentMQ != nil {
-		if err := s.commentMQ.Publish(ctx, comment.Username, comment.VideoID, comment.AuthorID, comment.Content); err == nil {
+		eventID := ""
+		if comment.EventID != nil {
+			eventID = *comment.EventID
+		}
+		if err := s.commentMQ.Publish(ctx, comment.Username, comment.VideoID, comment.AuthorID, comment.Content, eventID); err == nil {
 			mysqlEnqueued = true
 		}
 	}
+	// 热度事件单独生成幂等键：评论的 event_id 是给 comments 表唯一索引用的，
+	// 这是另一条消息、另一条链路，两者不该共用一个键（否则将来给评论消费端加
+	// 去重时会互相干扰）。理由同 Like：MQ 与降级路径必须共用同一个 ID。
+	popEventID, _ := rabbitmq.NewEventID()
+
 	if s.popularityMQ != nil {
-		if err := s.popularityMQ.Update(ctx, comment.VideoID, 1); err == nil {
+		if err := s.popularityMQ.Update(ctx, comment.VideoID, 1, popEventID); err == nil {
 			redisEnqueued = true
 		}
 	}
@@ -63,28 +79,18 @@ func (s *CommentService) Publish(ctx context.Context, comment *Comment) error {
 		return nil
 	}
 
-	// Fallback: direct MySQL write when comment MQ publish fails.
+	// 降级：MQ 发布失败时复用消费端同一个幂等事务入口（插评论 + 加热度同事务）。
 	if !mysqlEnqueued {
-		if err := s.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Select("id").First(&Video{}, comment.VideoID).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return errors.New("video not found")
-				}
-				return err
-			}
-			if err := tx.Create(comment).Error; err != nil {
-				return err
-			}
-			return tx.Model(&Video{}).Where("id = ?", comment.VideoID).
-				UpdateColumn("popularity", gorm.Expr("popularity + 1")).Error
-		}); err != nil {
+		if err := s.repo.ApplyPublish(ctx, comment); err != nil {
 			return err
 		}
 	}
 
-	// Fallback: direct Redis update when popularity MQ publish fails.
+	// 降级：热度事件发布失败时直写 Redis；热度是准实时数据，失败只记日志。
 	if !redisEnqueued {
-		UpdatePopularityCache(ctx, s.cache, comment.VideoID, 1)
+		if err := UpdatePopularityCache(ctx, s.cache, comment.VideoID, 1, popEventID); err != nil {
+			log.Printf("comment fallback: update popularity cache failed (video=%d): %v", comment.VideoID, err)
+		}
 	}
 	s.notifyMentions(ctx, comment)
 	return nil
@@ -106,7 +112,8 @@ func (s *CommentService) Delete(ctx context.Context, commentID uint, accountID u
 			return nil
 		}
 	}
-	return s.repo.DeleteComment(ctx, comment)
+	// 降级：直接删除。删除天然幂等，重复执行不会报错也不会产生副作用。
+	return s.repo.ApplyDelete(ctx, commentID)
 }
 
 func (s *CommentService) GetAll(ctx context.Context, videoID uint) ([]Comment, error) {

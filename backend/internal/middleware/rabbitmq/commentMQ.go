@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"time"
-
-	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// CommentMQ 负责「评论落库事件」的发布。
+// Publish 允许调用方传入 event_id：服务层在发布前先生成 ID，无论最终走 MQ 还是
+// 降级直写，都把同一个 ID 写进 comments 表，消费端才能靠唯一索引去重。
 type CommentMQ struct {
-	ch *amqp.Channel
+	p *publisher
 }
 
 const (
@@ -44,11 +45,24 @@ func NewCommentMQ(base *RabbitMQ) (*CommentMQ, error) {
 		ch.Close()
 		return nil, err
 	}
-	return &CommentMQ{ch: ch}, nil
+	p, err := newPublisher(ch, DefaultConfirmTimeout)
+	if err != nil {
+		ch.Close()
+		return nil, err
+	}
+	return &CommentMQ{p: p}, nil
 }
 
-func (c *CommentMQ) Publish(ctx context.Context, username string, videoID, authorID uint, content string) error {
+func (c *CommentMQ) Close() error {
+	if c == nil || c.p == nil {
+		return nil
+	}
+	return c.p.Close()
+}
+
+func (c *CommentMQ) Publish(ctx context.Context, username string, videoID, authorID uint, content, eventID string) error {
 	return c.publish(ctx, "publish", commentPublishRK, CommentEvent{
+		EventID:  eventID,
 		Username: username,
 		VideoID:  videoID,
 		AuthorID: authorID,
@@ -63,15 +77,17 @@ func (c *CommentMQ) Delete(ctx context.Context, commentID uint) error {
 }
 
 func (c *CommentMQ) publish(ctx context.Context, action, routingKey string, evt CommentEvent) error {
-	if c == nil || c.ch == nil {
+	if c == nil || c.p == nil {
 		return errors.New("comment mq is not initialized")
 	}
-	id, err := newEventID(16)
-	if err != nil {
-		return err
+	if evt.EventID == "" {
+		id, err := newEventID(16)
+		if err != nil {
+			return err
+		}
+		evt.EventID = id
 	}
-	evt.EventID = id
 	evt.Action = action
 	evt.OccurredAt = time.Now().UTC()
-	return PublishJSON(ctx, c.ch, commentExchange, routingKey, evt)
+	return c.p.PublishJSON(ctx, commentExchange, routingKey, evt)
 }

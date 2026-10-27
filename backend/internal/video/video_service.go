@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strconv"
+	"log"
 	"strings"
 	"time"
 
@@ -23,7 +23,7 @@ type VideoService struct {
 }
 
 func NewVideoService(repo *VideoRepository, cache *rediscache.Client, popularityMQ *rabbitmq.PopularityMQ) *VideoService {
-	return &VideoService{repo: repo, cache: cache, cacheTTL: 5 * time.Minute, popularityMQ: popularityMQ}
+	return &VideoService{repo: repo, cache: cache, cacheTTL: VideoEntityTTL, popularityMQ: popularityMQ}
 }
 
 func (vs *VideoService) Publish(ctx context.Context, video *Video) error {
@@ -50,11 +50,19 @@ func (vs *VideoService) Publish(ctx context.Context, video *Video) error {
 			return err
 		}
 
+		// EventID 在这里、也就是写入 outbox 的同一个事务里生成并落库。
+		// 之后无论 poller 重投多少次，带的都是同一个 event_id，
+		// 消费端才能靠它去重（confirm 丢失 ⇒ 必然重投，这是 Outbox 无法消除的前提）。
+		eventID, err := rabbitmq.NewEventID()
+		if err != nil {
+			return err
+		}
 		msg := OutboxMsg{
 			VideoID:    video.ID,
 			EventType:  "video_published",
-			Status:     "pending",
+			Status:     OutboxStatusPending,
 			CreateTime: video.CreateTime,
+			EventID:    &eventID,
 		}
 
 		if err := tx.Create(&msg).Error; err != nil {
@@ -91,10 +99,8 @@ func (vs *VideoService) Delete(ctx context.Context, id uint, authorID uint) erro
 	if err := vs.repo.DeleteVideo(ctx, id); err != nil {
 		return err
 	}
-	if vs.cache != nil {
-		cacheKey := vs.cache.Key("video:detail:id=%d", id)
-		_ = vs.cache.Del(context.Background(), cacheKey)
-	}
+	// 与 Feed 批量读取共用同一份实体缓存
+	InvalidateVideoEntity(context.Background(), vs.cache, id)
 	return nil
 }
 
@@ -107,15 +113,19 @@ func (vs *VideoService) ListByAuthorID(ctx context.Context, authorID uint) ([]Vi
 }
 
 func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) {
-	cacheKey := vs.cache.Key("video:detail:id=%d", id)
+	cacheKey := VideoEntityKey(vs.cache, id)
 
+	// 命中返回 (*Video, true)；缓存明确记录「不存在」时返回 (nil, true)。
 	getCached := func() (*Video, bool) {
-		opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		opCtx, cancel := context.WithTimeout(ctx, singleRedisOpTimeout)
 		defer cancel()
 
 		b, err := vs.cache.GetBytes(opCtx, cacheKey)
 		if err != nil {
 			return nil, false
+		}
+		if IsVideoEntityNull(string(b)) { // 占位值：确定不存在，不再回源
+			return nil, true
 		}
 		var cached Video
 		if err := json.Unmarshal(b, &cached); err != nil {
@@ -129,66 +139,54 @@ func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) 
 		if err != nil {
 			return
 		}
-		opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		opCtx, cancel := context.WithTimeout(ctx, singleRedisOpTimeout)
 		defer cancel()
 		_ = vs.cache.SetBytes(opCtx, cacheKey, b, vs.cacheTTL)
 	}
 
 	if vs.cache != nil {
 		if v, ok := getCached(); ok {
+			if v == nil { // 缓存明确记录了「不存在」
+				return nil, gorm.ErrRecordNotFound
+			}
 			return v, nil
 		}
 
-		opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-		b, err := vs.cache.GetBytes(opCtx, cacheKey)
-		cancel()
-		if err == nil {
-			var cached Video
-			if err := json.Unmarshal(b, &cached); err == nil {
-				return &cached, nil
-			}
-		} else if rediscache.IsMiss(err) {
-			lockKey := "lock:" + cacheKey
-
-			lockCtx, lockCancel := context.WithTimeout(ctx, 50*time.Millisecond)
-			token, locked, lockErr := vs.cache.Lock(lockCtx, lockKey, 2*time.Second)
-			lockCancel()
-
-			if lockErr == nil && locked {
-				defer func() { _ = vs.cache.Unlock(context.Background(), lockKey, token) }()
-
-				if v, ok := getCached(); ok {
-					return v, nil
+		// 回源用进程内 singleflight 去重，与 Feed 批量读取共用同一个 Group。
+		// 主键单行查询成本极小而并发量极大，用分布式锁不划算（理由见 EntityLoadGroup 的注释）。
+		v, err, _ := EntityLoadGroup.Do(EntitySingleflightKey(id), func() (interface{}, error) {
+			if v, ok := getCached(); ok { // 双重检查：等待期间可能已被回填
+				if v == nil {
+					return (*Video)(nil), gorm.ErrRecordNotFound
 				}
-
-				video, err := vs.repo.GetByID(ctx, id)
-				if err != nil {
-					return nil, err
-				}
-				setCached(video)
-				return video, nil
+				return v, nil
 			}
 
-			// 没拿到锁：等待别人回填缓存
-			for i := 0; i < 5; i++ {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(20 * time.Millisecond):
+			video, err := vs.repo.GetByID(ctx, id)
+			if err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					// 记下「这个 ID 确定不存在」，否则同一个不存在的 ID 每次请求
+					// 都会打一次 MySQL（缓存穿透）。短 TTL，数据补上后自动恢复。
+					SetVideoEntityNull(ctx, vs.cache, id)
 				}
-				if v, ok := getCached(); ok {
-					return v, nil
-				}
+				return (*Video)(nil), err
 			}
+			setCached(video)
+			return video, nil
+		})
+		if err != nil {
+			return nil, err
 		}
+
+		// singleflight 把同一个指针返回给所有等待者，而等待者是不同用户的请求。
+		// 各自持有副本，避免下游填充个性化字段时污染其他请求的响应。
+		safeCopy := *(v.(*Video))
+		return &safeCopy, nil
 	}
 
 	video, err := vs.repo.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
-	}
-	if vs.cache != nil {
-		setCached(video)
 	}
 	return video, nil
 }
@@ -205,26 +203,21 @@ func (vs *VideoService) UpdatePopularity(ctx context.Context, id uint, change in
 		return err
 	}
 
+	// 热度事件同样在发布前生成幂等键，MQ 与降级路径共用。
+	popEventID, _ := rabbitmq.NewEventID()
+
 	if vs.popularityMQ != nil {
-		if err := vs.popularityMQ.Update(ctx, id, change); err == nil {
+		if err := vs.popularityMQ.Update(ctx, id, change, popEventID); err == nil {
 			return nil
 		}
 	}
 
-	if vs.cache != nil {
-		// 1) 详情缓存：直接失效（最简单靠谱）
-		_ = vs.cache.Del(context.Background(), vs.cache.Key("video:detail:id=%d", id))
-
-		// 2) 热榜：写到“时间窗ZSET”，不要用 detail key
-		now := time.Now().UTC().Truncate(time.Minute)
-		windowKey := vs.cache.Key("hot:video:1m:%s", now.Format("200601021504"))
-		member := strconv.FormatUint(uint64(id), 10)
-
-		opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-		defer cancel()
-
-		_ = vs.cache.ZincrBy(opCtx, windowKey, member, float64(change))
-		_ = vs.cache.Expire(opCtx, windowKey, 2*time.Hour)
+	// 热度缓存的更新（失效实体缓存 + 写分钟窗 ZSET）在 UpdatePopularityCache 里已经有一份
+	// 实现，这里直接复用：原先那份内联副本把 50ms 的 context 同时给了 ZincrBy 和 Expire，
+	// 属于「带 timeout 的 context 跨 IO 步骤复用」，两份实现必然有一处漏修。
+	// 这里只记日志不返回错误：DB 已经写成功了，热度缓存失败不应该让整个接口报错。
+	if err := UpdatePopularityCache(ctx, vs.cache, id, change, popEventID); err != nil {
+		log.Printf("update popularity cache failed (video=%d): %v", id, err)
 	}
 	return nil
 }

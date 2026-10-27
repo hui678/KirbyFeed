@@ -78,8 +78,18 @@ func (h *AccountHandler) ChangePassword(c *gin.Context) {
 		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
 		return
 	}
-	if err := h.accountService.ChangePassword(c.Request.Context(), req.Username, req.OldPassword, req.NewPassword); err != nil {
-		c.JSON(400, gin.H{"error": "unsuccessfully password changed"})
+	// 改密必须是登录态操作：账号身份来自 JWTAuth 注入的 accountID，不由请求体指定。
+	accountID, err := getAccountID(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		return
+	}
+	if err := h.accountService.ChangePassword(c.Request.Context(), accountID, req.OldPassword, req.NewPassword); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsuccessfully password changed"})
 		return
 	}
 	c.JSON(200, gin.H{"message": "successfully password changed"})

@@ -19,15 +19,29 @@ type FeedVideoItem struct {
 	IsLiked     bool       `json:"is_liked"`
 }
 
+// TimelineCursor 时间线的**复合**游标 (create_time, id)。
+//
+// 为什么不能只用 create_time：同一毫秒可能发布多条视频，纯时间游标会把它们
+// 当成一个不可分的整体 —— 要么全部跳过（漏项），要么因 MySQL 在相同 create_time
+// 之间没有稳定顺序而被重复返回。加上 id 作为次级键后，"游标之后"才是严格全序的。
+//
+// 排序规则统一为 (create_time DESC, id DESC)，Redis 侧与 MySQL 侧必须完全一致。
+type TimelineCursor struct {
+	CreateTime time.Time
+	ID         uint
+}
+
 type ListLatestRequest struct {
-	Limit      int   `json:"limit"`
-	LatestTime int64 `json:"latest_time"`
+	Limit          int   `json:"limit"`
+	LatestTime     int64 `json:"latest_time"`
+	LatestIDBefore *uint `json:"latest_id_before,omitempty"`
 }
 
 type ListLatestResponse struct {
-	VideoList []FeedVideoItem `json:"video_list"`
-	NextTime  int64           `json:"next_time"`
-	HasMore   bool            `json:"has_more"`
+	VideoList    []FeedVideoItem `json:"video_list"`
+	NextTime     int64           `json:"next_time"`
+	NextIDBefore *uint           `json:"next_id_before,omitempty"`
+	HasMore      bool            `json:"has_more"`
 }
 
 type ListLikesCountRequest struct {
@@ -49,14 +63,16 @@ type ListLikesCountResponse struct {
 }
 
 type ListByFollowingRequest struct {
-	Limit      int   `json:"limit"`
-	LatestTime int64 `json:"latest_time"`
+	Limit          int   `json:"limit"`
+	LatestTime     int64 `json:"latest_time"`
+	LatestIDBefore *uint `json:"latest_id_before,omitempty"`
 }
 
 type ListByFollowingResponse struct {
-	VideoList []FeedVideoItem `json:"video_list"`
-	NextTime  int64           `json:"next_time"`
-	HasMore   bool            `json:"has_more"`
+	VideoList    []FeedVideoItem `json:"video_list"`
+	NextTime     int64           `json:"next_time"`
+	NextIDBefore *uint           `json:"next_id_before,omitempty"`
+	HasMore      bool            `json:"has_more"`
 }
 
 type ListByPopularityRequest struct {

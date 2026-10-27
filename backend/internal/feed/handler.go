@@ -25,15 +25,24 @@ func (f *FeedHandler) ListLatest(c *gin.Context) {
 	if req.Limit <= 0 || req.Limit > 50 {
 		req.Limit = 10
 	}
-	var latestTime time.Time
-	if req.LatestTime > 0 {
-		latestTime = time.UnixMilli(req.LatestTime)
+	// 复合游标：latest_time 必须与 latest_id_before 成对提供。
+	// 只给时间戳的话，同一毫秒发布的多条视频会被当成一个整体跳过，导致漏项。
+	var cursor *TimelineCursor
+	if req.LatestTime > 0 || req.LatestIDBefore != nil {
+		if req.LatestTime <= 0 || req.LatestIDBefore == nil || *req.LatestIDBefore == 0 {
+			c.JSON(400, gin.H{"error": "latest_time and latest_id_before must be provided together"})
+			return
+		}
+		cursor = &TimelineCursor{
+			CreateTime: time.UnixMilli(req.LatestTime),
+			ID:         *req.LatestIDBefore,
+		}
 	}
 	viewerAccountID, err := jwt.GetAccountID(c)
 	if err != nil {
 		viewerAccountID = 0
 	}
-	feedItems, err := f.service.ListLatest(c.Request.Context(), req.Limit, latestTime, viewerAccountID)
+	feedItems, err := f.service.ListLatest(c.Request.Context(), req.Limit, cursor, viewerAccountID)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -104,13 +113,23 @@ func (f *FeedHandler) ListByFollowing(c *gin.Context) {
 	if err != nil {
 		viewerAccountID = 0
 	}
-	var latestTime time.Time
-	if req.LatestTime > 0 {
-		latestTime = time.Unix(req.LatestTime, 0)
+	// 与 listLatest 同样使用复合游标，且单位统一为毫秒
+	var cursor *TimelineCursor
+	if req.LatestTime > 0 || req.LatestIDBefore != nil {
+		if req.LatestTime <= 0 || req.LatestIDBefore == nil || *req.LatestIDBefore == 0 {
+			c.JSON(400, gin.H{"error": "latest_time and latest_id_before must be provided together"})
+			return
+		}
+		cursor = &TimelineCursor{
+			CreateTime: time.UnixMilli(req.LatestTime),
+			ID:         *req.LatestIDBefore,
+		}
 	}
-	feedItems, err := f.service.ListByFollowing(c.Request.Context(), req.Limit, latestTime, viewerAccountID)
+	feedItems, err := f.service.ListByFollowing(c.Request.Context(), req.Limit, cursor, viewerAccountID)
 	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		// 用 ClassifyHTTPStatus 而不是写死 500：回源过载会被分类成 503，
+		// 客户端才知道该退避重试，而不是当成服务故障直接放弃。
+		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 	feedItems.VideoList = nonNilFeedVideoItems(feedItems.VideoList)

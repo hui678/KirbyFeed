@@ -1,13 +1,19 @@
 package account
 
+import "time"
+
 type Account struct {
 	ID           uint   `gorm:"primaryKey" json:"id"`
 	Username     string `gorm:"unique" json:"username"`
 	Password     string `json:"-"`
 	Token        string `json:"-"`
-	RefreshToken string `json:"-"`
-	AvatarURL    string `gorm:"type:varchar(512)" json:"avatar_url,omitempty"`
-	Bio          string `gorm:"type:varchar(255)" json:"bio,omitempty"`
+	RefreshToken string `gorm:"size:64;index" json:"-"`
+	// RefreshTokenExpiry：refresh token 的绝对过期时间。
+	// 修复要点：旧实现只在 Redis 侧用 TTL 表达「7 天」，MySQL 侧只有裸字符串，
+	// 一旦 Redis 不可用或 key 被淘汰，refresh token 就变成永久有效。
+	RefreshTokenExpiry time.Time `json:"-"`
+	AvatarURL          string    `gorm:"type:varchar(512)" json:"avatar_url,omitempty"`
+	Bio                string    `gorm:"type:varchar(255)" json:"bio,omitempty"`
 }
 
 type CreateAccountRequest struct {
@@ -39,8 +45,9 @@ type FindByUsernameResponse struct {
 	Username string `json:"username"`
 }
 
+// ChangePasswordRequest：改密是登录态操作，账号身份来自 access token，
+// 不再由请求体携带 username（否则知道用户名就能无限次试旧密码）。
 type ChangePasswordRequest struct {
-	Username    string `json:"username"`
 	OldPassword string `json:"old_password"`
 	NewPassword string `json:"new_password"`
 }

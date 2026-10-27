@@ -23,6 +23,11 @@ const state = reactive({
   limit: 10,
   asOf: 0,
   nextOffset: 0,
+  // DB 降级游标：Redis 不可用时服务端返回 as_of = 0 并改走 MySQL 复合游标，
+  // 此时 offset 不再有意义，翻页必须靠这三个字段。
+  nextLatestPopularity: 0,
+  nextLatestBefore: '',
+  nextLatestIDBefore: 0,
 })
 
 const likeBusy = reactive<Record<string, boolean>>({})
@@ -32,14 +37,23 @@ async function loadHot(reset: boolean) {
   state.loading = true
   state.error = ''
   try {
+    // 只要上一页返回过游标就一直带上：Redis 正常时服务端会忽略它，
+    // 一旦中途降级到 MySQL，它就成了唯一能继续翻页的依据。
+    const hasCursor = !reset && state.nextLatestIDBefore > 0 && state.nextLatestBefore !== ''
     const res = await feedApi.listByPopularity({
       limit: state.limit,
       as_of: reset ? 0 : state.asOf,
       offset: reset ? 0 : state.nextOffset,
+      latest_popularity: hasCursor ? state.nextLatestPopularity : undefined,
+      latest_before: hasCursor ? state.nextLatestBefore : undefined,
+      latest_id_before: hasCursor ? state.nextLatestIDBefore : undefined,
     })
     state.hasMore = res.has_more
     state.asOf = res.as_of
     state.nextOffset = res.next_offset
+    state.nextLatestPopularity = res.next_latest_popularity ?? 0
+    state.nextLatestBefore = res.next_latest_before ?? ''
+    state.nextLatestIDBefore = res.next_latest_id_before ?? 0
     state.items = reset ? res.video_list : state.items.concat(res.video_list)
   } catch (e) {
     state.error = e instanceof ApiError ? e.message : String(e)

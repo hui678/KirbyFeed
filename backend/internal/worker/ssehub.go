@@ -9,20 +9,24 @@ import (
 	"sync"
 	"time"
 
-	"feedsystem_video_go/internal/auth"
+	"feedsystem_video_go/internal/account"
+	jwt "feedsystem_video_go/internal/middleware/jwt"
+	rediscache "feedsystem_video_go/internal/middleware/redis"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
 
 type SSEHub struct {
-	mu      sync.RWMutex
-	clients map[uint][]chan *Notification
-	db      *gorm.DB
+	mu          sync.RWMutex
+	clients     map[uint][]chan *Notification
+	db          *gorm.DB
+	cache       *rediscache.Client
+	accountRepo *account.AccountRepository
 }
 
-func NewSSEHub(db *gorm.DB) *SSEHub {
-	return &SSEHub{clients: make(map[uint][]chan *Notification), db: db}
+func NewSSEHub(db *gorm.DB, cache *rediscache.Client, accountRepo *account.AccountRepository) *SSEHub {
+	return &SSEHub{clients: make(map[uint][]chan *Notification), db: db, cache: cache, accountRepo: accountRepo}
 }
 
 func (h *SSEHub) Push(userID uint, n *Notification) {
@@ -88,9 +92,11 @@ func (h *SSEHub) SSERequireAuth() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 			return
 		}
-		claims, err := auth.ParseToken(token)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+		// 修复要点：旧实现只 ParseToken，不查吊销 —— 登出/改密后旧 token 仍能收推送，
+		// 直到 access token 自然过期。这里复用 HTTP 中间件同一套判活逻辑。
+		claims, ok := jwt.VerifyToken(c.Request.Context(), token, h.accountRepo, h.cache)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or revoked token"})
 			return
 		}
 		c.Set("accountID", claims.AccountID)

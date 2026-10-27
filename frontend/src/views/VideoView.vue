@@ -119,12 +119,44 @@ async function computeChunkMD5(blob: Blob): Promise<string> {
   return spark.end()
 }
 
-const CHUNK_SIZE = 5 << 20 // 5 MB
+const CHUNK_SIZE = 5 << 20 // 5 MB，与后端 video.ChunkSize 对齐
 const MAX_CONCURRENT = 3
 const MAX_RETRIES = 3
+const CHUNK_TIMEOUT_MS = 120_000 // 单片 5MB，弱网下也该在 2 分钟内给出结果
+const MAX_RESUME_ROUNDS = 3 // 合并前最多按服务端位图补传几轮
+
+function sleep(ms: number) {
+  return new Promise<void>((r) => setTimeout(r, ms))
+}
+
+// 只有「可能是暂时性故障」的错误才重试：4xx 说明请求本身不对，重试也不会变好
+function isFatal(e: unknown): boolean {
+  if (e instanceof ApiError) {
+    if (e.status === 401 || e.status === 408 || e.status === 409) return false
+    return e.status >= 400 && e.status < 500
+  }
+  return false
+}
+
+// 服务端在合并时发现「位图说传了、磁盘上没有」的分片，会回一个缺失清单。
+// 只有把这几片重新传一次，这个会话才不会一路卡到 TTL 过期。
+function missingChunkIndices(e: unknown): number[] {
+  if (!(e instanceof ApiError) || !e.payload || typeof e.payload !== 'object') return []
+  const raw = (e.payload as { missing_chunks?: unknown }).missing_chunks
+  if (!Array.isArray(raw)) return []
+  return raw.filter((i): i is number => Number.isInteger(i) && (i as number) >= 0)
+}
+
+function chunkBytes(chunkIndex: number, file: File): number {
+  const start = chunkIndex * CHUNK_SIZE
+  return Math.min(start + CHUNK_SIZE, file.size) - start
+}
 
 async function uploadVideoChunked(file: File): Promise<videoApi.UploadResponse> {
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
+  // SparkMD5 是同步计算，会占住主线程；先让浏览器把提示画出来再算
+  stage.value = '计算文件指纹'
+  await sleep(0)
   const fileHash = await computeFileMD5(file)
 
   stage.value = '初始化上传'
@@ -137,43 +169,19 @@ async function uploadVideoChunked(file: File): Promise<videoApi.UploadResponse> 
   })
 
   const uploadId = initRes.upload_id
-  const uploadedSet = new Set(initRes.uploaded_chunks)
+  // 断点续传：init 命中的就是服务端位图里已置位的分片，直接跳过
+  const done = new Set<number>(initRes.uploaded_chunks)
 
   uploadProgress.totalBytes = file.size
-  uploadProgress.uploadedBytes = uploadedSet.size * CHUNK_SIZE
-  // Last chunk might be smaller
-  if (uploadedSet.has(totalChunks - 1)) {
-    uploadProgress.uploadedBytes -= CHUNK_SIZE
-    uploadProgress.uploadedBytes += file.size - (totalChunks - 1) * CHUNK_SIZE
-  }
-  uploadProgress.percent = uploadProgress.totalBytes > 0
-    ? Math.round((uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100)
-    : 0
-
-  // Build list of chunks that still need uploading
-  const pending: number[] = []
-  for (let i = 0; i < totalChunks; i++) {
-    if (!uploadedSet.has(i)) {
-      pending.push(i)
+  const syncProgress = () => {
+    let bytes = 0
+    for (let i = 0; i < totalChunks; i++) {
+      if (done.has(i)) bytes += chunkBytes(i, file)
     }
+    uploadProgress.uploadedBytes = bytes
+    uploadProgress.percent = file.size > 0 ? Math.round((bytes / file.size) * 100) : 0
   }
-
-  if (pending.length === 0) {
-    stage.value = '合并文件'
-    return videoApi.completeChunkUpload(uploadId)
-  }
-
-  stage.value = '上传视频'
-
-  // Upload chunks with concurrency limit
-  let idx = 0
-  const advanceProgress = (chunkIndex: number) => {
-    const chunkBytes = chunkIndex === totalChunks - 1
-      ? file.size - chunkIndex * CHUNK_SIZE
-      : CHUNK_SIZE
-    uploadProgress.uploadedBytes += chunkBytes
-    uploadProgress.percent = Math.round((uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100)
-  }
+  syncProgress()
 
   const uploadOne = async (chunkIndex: number): Promise<void> => {
     const start = chunkIndex * CHUNK_SIZE
@@ -184,39 +192,102 @@ async function uploadVideoChunked(file: File): Promise<videoApi.UploadResponse> 
     let lastErr: unknown
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
-        await videoApi.uploadChunk(uploadId, chunkIndex, chunkHash, blob)
-        advanceProgress(chunkIndex)
+        await videoApi.uploadChunk(uploadId, chunkIndex, chunkHash, blob, CHUNK_TIMEOUT_MS)
+        done.add(chunkIndex)
+        syncProgress()
         return
       } catch (e) {
         lastErr = e
+        if (isFatal(e)) break
+        // 指数退避 + jitter：避免同一瞬间的失败请求一起重试，把服务端再打一遍
+        if (attempt < MAX_RETRIES - 1) {
+          await sleep(300 * 2 ** attempt + Math.random() * 200)
+        }
       }
     }
     throw lastErr
   }
 
-  await new Promise<void>((resolve, reject) => {
-    let active = 0
-    let done = false
+  // 并发池：同一时刻最多 MAX_CONCURRENT 个分片在飞
+  const runPool = async (indices: number[]): Promise<void> => {
+    let idx = 0
+    await new Promise<void>((resolve, reject) => {
+      let active = 0
+      let stopped = false
 
-    const next = () => {
-      if (done) return
-      if (idx >= pending.length && active === 0) {
-        resolve()
-        return
+      const next = () => {
+        if (stopped) return
+        if (idx >= indices.length && active === 0) {
+          resolve()
+          return
+        }
+        while (active < MAX_CONCURRENT && idx < indices.length) {
+          const ci = indices[idx++] as number
+          active++
+          uploadOne(ci)
+            .then(() => { active--; next() })
+            .catch((e) => { stopped = true; reject(e) })
+        }
       }
-      while (active < MAX_CONCURRENT && idx < pending.length) {
-        const ci = pending[idx++] as number
-        active++
-        uploadOne(ci)
-          .then(() => { active--; next() })
-          .catch((e) => { done = true; reject(e) })
-      }
+      next()
+    })
+  }
+
+  const missingChunks = (uploaded: number[]): number[] => {
+    const set = new Set(uploaded)
+    const gaps: number[] = []
+    for (let i = 0; i < totalChunks; i++) {
+      if (!set.has(i)) gaps.push(i)
     }
-    next()
-  })
+    return gaps
+  }
+
+  const pending = missingChunks(initRes.uploaded_chunks)
+  if (pending.length > 0) {
+    stage.value = '上传视频'
+    await runPool(pending)
+  }
+
+  // 合并前用服务端位图核对一次：并发或重试中「服务端成功但响应丢了」的分片，
+  // 在这里按缺口补传，而不是让 complete 直接 400。
+  for (let round = 0; round < MAX_RESUME_ROUNDS; round++) {
+    stage.value = '核对分片'
+    const st = await videoApi.chunkStatus(uploadId)
+    // 以服务端位图为准：本地记账可能因「服务端成功但响应丢了」而不全
+    st.uploaded_chunks.forEach((i) => done.add(i))
+    syncProgress()
+    const gaps = missingChunks(st.uploaded_chunks)
+    if (gaps.length === 0) break
+    stage.value = `补传分片（第 ${round + 1} 轮，缺 ${gaps.length} 片）`
+    await runPool(gaps)
+  }
 
   stage.value = '合并文件'
-  return videoApi.completeChunkUpload(uploadId)
+  let lastErr: unknown
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await videoApi.completeChunkUpload(uploadId)
+    } catch (e) {
+      lastErr = e
+      // 409 = 服务端正在合并（并发 complete），稍等后重试即可，不是失败
+      if (e instanceof ApiError && e.status === 409) {
+        await sleep(1000 * (attempt + 1))
+        continue
+      }
+      // 位图声称已传的分片在磁盘上并不存在：把这几片从本地记账里抹掉并立刻补传，
+      // 下一轮再合并。少了这一步，这个会话会一直卡到 24h TTL 过期。
+      const missing = missingChunkIndices(e)
+      if (missing.length > 0) {
+        missing.forEach((i) => done.delete(i))
+        syncProgress()
+        stage.value = `补传丢失的分片（${missing.length} 片）`
+        await runPool(missing)
+        continue
+      }
+      throw e
+    }
+  }
+  throw lastErr
 }
 
 async function onPublish() {

@@ -4,88 +4,46 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/social"
-	"log"
-	"time"
 
-	"github.com/go-sql-driver/mysql"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// SocialWorker 消费「关注/取关事件」。
+// 幂等靠 (follower_id, vlogger_id) 唯一索引 + RowsAffected 判断，
+// 不再靠「吞掉 1062 错误」这种隐式方式。
 type SocialWorker struct {
-	ch    *amqp.Channel
 	repo  *social.SocialRepository
 	queue string
+	retry RetryPublisher
 }
 
-func NewSocialWorker(ch *amqp.Channel, repo *social.SocialRepository, queue string) *SocialWorker {
-	return &SocialWorker{ch: ch, repo: repo, queue: queue}
+func NewSocialWorker(repo *social.SocialRepository, queue string, retry RetryPublisher) *SocialWorker {
+	return &SocialWorker{repo: repo, queue: queue, retry: retry}
 }
 
-func (w *SocialWorker) Run(ctx context.Context) error {
-	if w == nil || w.ch == nil || w.repo == nil {
+func (w *SocialWorker) Run(ctx context.Context, ch *amqp.Channel) error {
+	if w == nil || w.repo == nil {
 		return errors.New("social worker is not initialized")
 	}
 	if w.queue == "" {
 		return errors.New("queue is required")
 	}
-
-	deliveries, err := w.ch.Consume(
-		w.queue,
-		"",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
+	c := &Consumer{
+		Name:    "SocialWorker",
+		Queue:   w.queue,
+		Retry:   w.retry,
+		Process: w.process,
 	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case d, ok := <-deliveries:
-			if !ok {
-				return errors.New("deliveries channel closed")
-			}
-			w.handleDelivery(ctx, d)
-		}
-	}
+	return c.Run(ctx, ch)
 }
 
-func (w *SocialWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
-	const maxRetries = 3
-	for i := 0; i <= maxRetries; i++ {
-		select {
-		case <-ctx.Done():
-			_ = d.Nack(false, true)
-			return
-		default:
-		}
-		if err := w.process(ctx, d.Body); err != nil {
-			if i >= maxRetries {
-				log.Printf("social worker: 重试 %d 次后仍失败, 丢弃: %v", maxRetries, err)
-				_ = d.Ack(false)
-				return
-			}
-			wait := time.Duration(1<<uint(i)) * time.Second
-			log.Printf("social worker: 处理失败, %v 后重试 (%d/%d): %v", wait, i+1, maxRetries, err)
-			time.Sleep(wait)
-			continue
-		}
-		_ = d.Ack(false)
-		return
-	}
-}
-
-func (w *SocialWorker) process(ctx context.Context, body []byte) error {
+func (w *SocialWorker) process(ctx context.Context, d amqp.Delivery) error {
 	var evt rabbitmq.SocialEvent
-	if err := json.Unmarshal(body, &evt); err != nil {
-		// 解析事件失败，直接丢弃
+	if err := json.Unmarshal(d.Body, &evt); err != nil {
+		// 坏消息，重试无意义
 		return nil
 	}
 	if evt.FollowerID == 0 || evt.VloggerID == 0 {
@@ -94,23 +52,17 @@ func (w *SocialWorker) process(ctx context.Context, body []byte) error {
 
 	switch evt.Action {
 	case "follow":
-		err := w.repo.Follow(ctx, &social.Social{
+		_, err := w.repo.ApplyFollow(ctx, &social.Social{
 			FollowerID: evt.FollowerID,
 			VloggerID:  evt.VloggerID,
 		})
-		if err == nil {
-			return nil
-		}
-		var mysqlErr *mysql.MySQLError
-		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
-			return nil
-		}
 		return err
 	case "unfollow":
-		return w.repo.Unfollow(ctx, &social.Social{
+		_, err := w.repo.ApplyUnfollow(ctx, &social.Social{
 			FollowerID: evt.FollowerID,
 			VloggerID:  evt.VloggerID,
 		})
+		return err
 	default:
 		return nil
 	}

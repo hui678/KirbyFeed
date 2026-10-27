@@ -68,13 +68,21 @@ func DeclareTopic(ch *amqp.Channel, exchange string, queue string, bindingKey st
 		return err
 	}
 
+	// 死信交换机 + 死信路由键一起指定：死信交换机是所有主队列共用的 dlx.events，
+	// 如果只给交换机不给路由键，死信会沿用原始 routing key（如 like.like），
+	// 而每个 <queue>.dlx 又都用 "#" 绑定在同一个 exchange 上，结果一条死信被
+	// 复制到所有死信队列，可能被不相干的消费者处理。这里改成「每个主队列一个专属
+	// 死信路由键」，让死信只落到它自己的死信队列。
 	q, err := ch.QueueDeclare(
 		queue,
 		true,
 		false,
 		false,
 		false,
-		amqp.Table{"x-dead-letter-exchange": DLXExchange},
+		amqp.Table{
+			"x-dead-letter-exchange":    DLXExchange,
+			"x-dead-letter-routing-key": DLQRoutingKey(queue),
+		},
 	)
 	if err != nil {
 		return err
@@ -120,4 +128,11 @@ func newEventID(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// NewEventID 生成一个事件 ID。服务层需要它来做「发布前先定 ID」的幂等设计：
+// 同一条业务事件无论走 MQ 还是降级直写，都携带同一个 event_id，
+// 这样消费端才能靠唯一索引去重。
+func NewEventID() (string, error) {
+	return newEventID(16)
 }

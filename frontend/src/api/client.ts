@@ -15,6 +15,21 @@ export class ApiError extends Error {
 
 type ApiErrorBody = { error?: string }
 
+export type RequestOptions = { authRequired?: boolean; timeoutMs?: number }
+
+// 分片上传这类大请求必须自带超时：否则弱网下 fetch 会一直挂着，
+// 前端永远等不到失败，也就永远触发不了重试/续传。
+function createTimeout(timeoutMs?: number): { signal?: AbortSignal; clear: () => void } {
+  if (!timeoutMs || timeoutMs <= 0) return { clear: () => {} }
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  return { signal: ctrl.signal, clear: () => clearTimeout(timer) }
+}
+
+function isAbort(e: unknown): boolean {
+  return e instanceof Error && e.name === 'AbortError'
+}
+
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api'
 
 let isRefreshing = false
@@ -46,7 +61,7 @@ async function tryRefresh(): Promise<string | null> {
   return refreshPromise
 }
 
-export async function postJson<T>(path: string, body: unknown, options?: { authRequired?: boolean }): Promise<T> {
+export async function postJson<T>(path: string, body: unknown, options?: RequestOptions): Promise<T> {
   const auth = useAuthStore()
   const token = auth.token
 
@@ -57,27 +72,36 @@ export async function postJson<T>(path: string, body: unknown, options?: { authR
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (token) headers.Authorization = `Bearer ${token}`
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body ?? {}),
-  })
+  const { signal, clear } = createTimeout(options?.timeoutMs)
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body ?? {}),
+      signal,
+    })
 
-  if (res.status === 401 && path !== '/account/refresh') {
-    const newToken = await tryRefresh()
-    if (newToken) {
-      headers.Authorization = `Bearer ${newToken}`
-      const retryRes = await fetch(`${API_BASE}${path}`, {
-        method: 'POST', headers, body: JSON.stringify(body ?? {}),
-      })
-      return handleResponse<T>(retryRes, path)
+    if (res.status === 401 && path !== '/account/refresh') {
+      const newToken = await tryRefresh()
+      if (newToken) {
+        headers.Authorization = `Bearer ${newToken}`
+        const retryRes = await fetch(`${API_BASE}${path}`, {
+          method: 'POST', headers, body: JSON.stringify(body ?? {}), signal,
+        })
+        return handleResponse<T>(retryRes, path)
+      }
     }
-  }
 
-  return handleResponse<T>(res, path)
+    return handleResponse<T>(res, path)
+  } catch (e) {
+    if (isAbort(e)) throw new ApiError('请求超时', 408)
+    throw e
+  } finally {
+    clear()
+  }
 }
 
-export async function postForm<T>(path: string, body: FormData, options?: { authRequired?: boolean }): Promise<T> {
+export async function postForm<T>(path: string, body: FormData, options?: RequestOptions): Promise<T> {
   const auth = useAuthStore()
   const token = auth.token
 
@@ -88,24 +112,33 @@ export async function postForm<T>(path: string, body: FormData, options?: { auth
   const headers: Record<string, string> = {}
   if (token) headers.Authorization = `Bearer ${token}`
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers,
-    body,
-  })
+  const { signal, clear } = createTimeout(options?.timeoutMs)
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers,
+      body,
+      signal,
+    })
 
-  if (res.status === 401 && path !== '/account/refresh') {
-    const newToken = await tryRefresh()
-    if (newToken) {
-      headers.Authorization = `Bearer ${newToken}`
-      const retryRes = await fetch(`${API_BASE}${path}`, {
-        method: 'POST', headers, body,
-      })
-      return handleResponse<T>(retryRes, path)
+    if (res.status === 401 && path !== '/account/refresh') {
+      const newToken = await tryRefresh()
+      if (newToken) {
+        headers.Authorization = `Bearer ${newToken}`
+        const retryRes = await fetch(`${API_BASE}${path}`, {
+          method: 'POST', headers, body, signal,
+        })
+        return handleResponse<T>(retryRes, path)
+      }
     }
-  }
 
-  return handleResponse<T>(res, path)
+    return handleResponse<T>(res, path)
+  } catch (e) {
+    if (isAbort(e)) throw new ApiError('请求超时', 408)
+    throw e
+  } finally {
+    clear()
+  }
 }
 
 async function handleResponse<T>(res: Response, path: string): Promise<T> {

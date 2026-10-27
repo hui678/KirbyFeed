@@ -19,13 +19,14 @@ type ListState = {
   has_more: boolean
 }
 
-const latest = reactive<ListState & { limit: number; next_time: number }>({
+const latest = reactive<ListState & { limit: number; next_time: number; next_id_before?: number }>({
   loading: false,
   error: '',
   items: [],
   has_more: false,
   limit: 10,
   next_time: 0,
+  next_id_before: undefined,
 })
 
 const likesCount = reactive<ListState & { limit: number; next_likes_count_before?: number; next_id_before?: number }>({
@@ -38,13 +39,14 @@ const likesCount = reactive<ListState & { limit: number; next_likes_count_before
   next_id_before: undefined,
 })
 
-const following = reactive<ListState & { limit: number; next_time: number }>({
+const following = reactive<ListState & { limit: number; next_time: number; next_id_before?: number }>({
   loading: false,
   error: '',
   items: [],
   has_more: false,
   limit: 10,
   next_time: 0,
+  next_id_before: undefined,
 })
 
 const action = reactive<{ loading: boolean; error: string; payload: unknown; name: string }>({
@@ -75,10 +77,14 @@ async function loadLatest(reset: boolean) {
   latest.loading = true
   latest.error = ''
   try {
-    const latest_time = reset ? 0 : latest.next_time
-    const res = await feedApi.listLatest({ limit: latest.limit, latest_time })
+    const res = await feedApi.listLatest({
+      limit: latest.limit,
+      latest_time: reset ? 0 : latest.next_time,
+      latest_id_before: reset ? undefined : latest.next_id_before,
+    })
     latest.has_more = res.has_more
     latest.next_time = res.next_time
+    latest.next_id_before = res.next_id_before
     latest.items = reset ? res.video_list : latest.items.concat(res.video_list)
   } catch (e) {
     latest.error = e instanceof ApiError ? e.message : String(e)
@@ -111,10 +117,14 @@ async function loadFollowing(reset: boolean) {
   following.loading = true
   following.error = ''
   try {
-    const latest_time = reset ? 0 : following.next_time
-    const res = await feedApi.listByFollowing({ limit: following.limit, latest_time })
+    const res = await feedApi.listByFollowing({
+      limit: following.limit,
+      latest_time: reset ? 0 : following.next_time,
+      latest_id_before: reset ? undefined : following.next_id_before,
+    })
     following.has_more = res.has_more
     following.next_time = res.next_time
+    following.next_id_before = res.next_id_before
     following.items = reset ? res.video_list : following.items.concat(res.video_list)
   } catch (e) {
     following.error = e instanceof ApiError ? e.message : String(e)

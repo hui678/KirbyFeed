@@ -61,7 +61,7 @@ services:
     restart: always
     environment:
       CONFIG_PATH: /app/configs/config.yaml
-      JWT_SECRET: ${JWT_SECRET:-feedsystem-dev-secret-key}
+      JWT_SECRET: ${JWT_SECRET:-feedsystem-dev-secret-key-please-override-in-prod}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-feedsystem}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-123456}
@@ -93,7 +93,7 @@ services:
     restart: always
     environment:
       CONFIG_PATH: /app/configs/config.yaml
-      JWT_SECRET: ${JWT_SECRET:-feedsystem-dev-secret-key}
+      JWT_SECRET: ${JWT_SECRET:-feedsystem-dev-secret-key-please-override-in-prod}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-feedsystem}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-123456}

@@ -4,92 +4,56 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/video"
-	"log"
-	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// PopularityWorker 消费「热度事件」，只写 Redis（失效实体缓存 + 分钟桶 ZSET）。
+// 它与落库 Worker 完全独立：Redis 挂了不会拖慢 MySQL 落库，MySQL 慢了也不会
+// 让热度事件堆积在落库队列里。
 type PopularityWorker struct {
-	ch    *amqp.Channel
 	cache *rediscache.Client
 	queue string
+	retry RetryPublisher
 }
 
-func NewPopularityWorker(ch *amqp.Channel, cache *rediscache.Client, queue string) *PopularityWorker {
-	return &PopularityWorker{ch: ch, cache: cache, queue: queue}
+func NewPopularityWorker(cache *rediscache.Client, queue string, retry RetryPublisher) *PopularityWorker {
+	return &PopularityWorker{cache: cache, queue: queue, retry: retry}
 }
 
-func (w *PopularityWorker) Run(ctx context.Context) error {
-	if w == nil || w.ch == nil || w.cache == nil {
+func (w *PopularityWorker) Run(ctx context.Context, ch *amqp.Channel) error {
+	if w == nil || w.cache == nil {
 		return errors.New("popularity worker is not initialized")
 	}
 	if w.queue == "" {
 		return errors.New("queue is required")
 	}
-
-	deliveries, err := w.ch.Consume(
-		w.queue,
-		"",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
+	c := &Consumer{
+		Name:    "PopularityWorker",
+		Queue:   w.queue,
+		Retry:   w.retry,
+		Process: w.process,
 	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case d, ok := <-deliveries:
-			if !ok {
-				return errors.New("deliveries channel closed")
-			}
-			w.handleDelivery(ctx, d)
-		}
-	}
+	return c.Run(ctx, ch)
 }
 
-func (w *PopularityWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
-	const maxRetries = 3
-	for i := 0; i <= maxRetries; i++ {
-		select {
-		case <-ctx.Done():
-			_ = d.Nack(false, true)
-			return
-		default:
-		}
-		if err := w.process(ctx, d.Body); err != nil {
-			if i >= maxRetries {
-				log.Printf("popularity worker: 重试 %d 次后仍失败, 丢弃: %v", maxRetries, err)
-				_ = d.Ack(false)
-				return
-			}
-			wait := time.Duration(1<<uint(i)) * time.Second
-			log.Printf("popularity worker: 处理失败, %v 后重试 (%d/%d): %v", wait, i+1, maxRetries, err)
-			time.Sleep(wait)
-			continue
-		}
-		_ = d.Ack(false)
-		return
-	}
-}
-
-func (w *PopularityWorker) process(ctx context.Context, body []byte) error {
+func (w *PopularityWorker) process(ctx context.Context, d amqp.Delivery) error {
 	var evt rabbitmq.PopularityEvent
-	if err := json.Unmarshal(body, &evt); err != nil {
+	if err := json.Unmarshal(d.Body, &evt); err != nil {
+		// 坏消息，重试无意义
 		return nil
 	}
 	if evt.VideoID == 0 || evt.Change == 0 {
 		return nil
 	}
-	video.UpdatePopularityCache(ctx, w.cache, evt.VideoID, evt.Change)
-	return nil
+	// 必须把 Redis 错误抛出去：旧实现吞掉错误后照样 Ack，
+	// Redis 故障期间所有热度事件被静默丢弃，热榜根本谈不上「最终一致」。
+	//
+	// 传 evt.EventID 做幂等：ZINCRBY 是累加、天生不幂等，「先处理再 ACK、崩溃重投」
+	// 会把热榜刷高一分。去重的原子性由 UpdatePopularityCache 里的 Lua 脚本保证。
+	return video.UpdatePopularityCache(ctx, w.cache, evt.VideoID, evt.Change, evt.EventID)
 }

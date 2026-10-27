@@ -46,23 +46,33 @@ export function initChunkUpload(input: {
   return postJson<InitChunkUploadResponse>('/video/chunk/init', input, { authRequired: true })
 }
 
-export function uploadChunk(uploadId: string, chunkIndex: number, chunkHash: string, blob: Blob) {
+export function uploadChunk(
+  uploadId: string,
+  chunkIndex: number,
+  chunkHash: string,
+  blob: Blob,
+  timeoutMs?: number,
+) {
   const fd = new FormData()
   fd.append('upload_id', uploadId)
   fd.append('chunk_index', String(chunkIndex))
   fd.append('chunk_hash', chunkHash)
   fd.append('file', blob)
-  return postForm<{ chunk_index: number }>('/video/chunk/upload', fd, { authRequired: true })
+  return postForm<{ chunk_index: number }>('/video/chunk/upload', fd, { authRequired: true, timeoutMs })
 }
 
 export function chunkStatus(uploadId: string) {
-  return postJson<{ upload_id: string; uploaded_chunks: number[]; total_chunks: number }>(
+  return postJson<{ upload_id: string; uploaded_chunks: number[]; total_chunks: number; completed: boolean }>(
     '/video/chunk/status',
     { upload_id: uploadId },
-    { authRequired: true },
+    { authRequired: true, timeoutMs: 15_000 },
   )
 }
 
 export function completeChunkUpload(uploadId: string) {
-  return postJson<UploadResponse>('/video/chunk/complete', { upload_id: uploadId }, { authRequired: true })
+  return postJson<UploadResponse>(
+    '/video/chunk/complete',
+    { upload_id: uploadId },
+    { authRequired: true, timeoutMs: 300_000 },
+  )
 }

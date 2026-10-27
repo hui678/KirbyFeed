@@ -17,12 +17,13 @@ export function rename(newUsername: string) {
   return postJson<TokenResponse>('/account/rename', { new_username: newUsername }, { authRequired: true })
 }
 
-export function changePassword(username: string, oldPassword: string, newPassword: string) {
-  return postJson<MessageResponse>('/account/changePassword', {
-    username,
-    old_password: oldPassword,
-    new_password: newPassword,
-  })
+// 改密是登录态接口：账号身份由 access token 决定，不再由请求体携带 username。
+export function changePassword(oldPassword: string, newPassword: string) {
+  return postJson<MessageResponse>(
+    '/account/changePassword',
+    { old_password: oldPassword, new_password: newPassword },
+    { authRequired: true },
+  )
 }
 
 export function findById(id: number) {

@@ -2,8 +2,10 @@ package video
 
 import (
 	"context"
+	"strings"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type CommentRepository struct {
@@ -20,6 +22,65 @@ func (r *CommentRepository) CreateComment(ctx context.Context, comment *Comment)
 
 func (r *CommentRepository) DeleteComment(ctx context.Context, comment *Comment) error {
 	return r.db.WithContext(ctx).Delete(comment).Error
+}
+
+// ApplyPublish 是消费端唯一的评论写入入口：插评论 + 加热度同事务，靠 event_id 幂等。
+//
+// 与点赞同理：如果插行和热度更新是两条独立 SQL，插行成功、热度失败后重试会被
+// event_id 唯一索引挡住，热度永远补不上。放进一个事务后重试才是幂等且完整的。
+func (r *CommentRepository) ApplyPublish(ctx context.Context, comment *Comment) error {
+	if comment == nil || comment.VideoID == 0 {
+		return nil
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		exists, err := videoExistsTx(tx, comment.VideoID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			// 视频已被删除，事件作废。
+			return nil
+		}
+
+		res := tx.Clauses(clause.Insert{Modifier: "IGNORE"}).Create(comment)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			// 同一 event_id 已经写过，重复投递，什么都不做。
+			return nil
+		}
+		return bumpVideoColumn(tx, comment.VideoID, "popularity", 1)
+	})
+}
+
+// ApplyDelete 删除评论。删除本身天然幂等：RowsAffected=0 说明已经删过了。
+func (r *CommentRepository) ApplyDelete(ctx context.Context, commentID uint) error {
+	if commentID == 0 {
+		return nil
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Where("id = ?", commentID).Delete(&Comment{})
+		if res.Error != nil {
+			return res.Error
+		}
+		return nil
+	})
+}
+
+// FindByEventID 按幂等键查询，供兜底/排查使用。
+func (r *CommentRepository) FindByEventID(ctx context.Context, eventID string) (*Comment, error) {
+	if strings.TrimSpace(eventID) == "" {
+		return nil, nil
+	}
+	var c Comment
+	if err := r.db.WithContext(ctx).Where("event_id = ?", eventID).First(&c).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &c, nil
 }
 
 func (r *CommentRepository) GetAllComments(ctx context.Context, videoID uint) ([]Comment, error) {

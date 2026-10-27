@@ -4,88 +4,46 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/video"
-	"log"
-	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// LikeWorker 消费「点赞落库事件」，只负责 MySQL 里的 likes 行与 videos 计数。
+// 热度（Redis 分钟桶）由 PopularityWorker 消费另一条消息完成，两者互不影响。
 type LikeWorker struct {
-	ch     *amqp.Channel
-	likes  *video.LikeRepository
-	videos *video.VideoRepository
-	queue  string
+	likes *video.LikeRepository
+	queue string
+	retry RetryPublisher
 }
 
-func NewLikeWorker(ch *amqp.Channel, likes *video.LikeRepository, videos *video.VideoRepository, queue string) *LikeWorker {
-	return &LikeWorker{ch: ch, likes: likes, videos: videos, queue: queue}
+func NewLikeWorker(likes *video.LikeRepository, queue string, retry RetryPublisher) *LikeWorker {
+	return &LikeWorker{likes: likes, queue: queue, retry: retry}
 }
 
-func (w *LikeWorker) Run(ctx context.Context) error {
-	if w == nil || w.ch == nil || w.likes == nil || w.videos == nil {
+func (w *LikeWorker) Run(ctx context.Context, ch *amqp.Channel) error {
+	if w == nil || w.likes == nil {
 		return errors.New("like worker is not initialized")
 	}
 	if w.queue == "" {
 		return errors.New("queue is required")
 	}
-
-	deliveries, err := w.ch.Consume(
-		w.queue,
-		"",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
+	c := &Consumer{
+		Name:    "LikeWorker",
+		Queue:   w.queue,
+		Retry:   w.retry,
+		Process: w.process,
 	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case d, ok := <-deliveries:
-			if !ok {
-				return errors.New("deliveries channel closed")
-			}
-			w.handleDelivery(ctx, d)
-		}
-	}
+	return c.Run(ctx, ch)
 }
 
-func (w *LikeWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
-	const maxRetries = 3
-	for i := 0; i <= maxRetries; i++ {
-		select {
-		case <-ctx.Done():
-			_ = d.Nack(false, true)
-			return
-		default:
-		}
-		if err := w.process(ctx, d.Body); err != nil {
-			if i >= maxRetries {
-				log.Printf("like worker: 重试 %d 次后仍失败, 丢弃: %v", maxRetries, err)
-				_ = d.Ack(false)
-				return
-			}
-			wait := time.Duration(1<<uint(i)) * time.Second
-			log.Printf("like worker: 处理失败, %v 后重试 (%d/%d): %v", wait, i+1, maxRetries, err)
-			time.Sleep(wait)
-			continue
-		}
-		_ = d.Ack(false)
-		return
-	}
-}
-
-func (w *LikeWorker) process(ctx context.Context, body []byte) error {
+func (w *LikeWorker) process(ctx context.Context, d amqp.Delivery) error {
 	var evt rabbitmq.LikeEvent
-	if err := json.Unmarshal(body, &evt); err != nil {
-		// 解析事件失败，直接丢弃
+	if err := json.Unmarshal(d.Body, &evt); err != nil {
+		// 结构性坏消息（不是业务失败）：重试多少次都解不开，直接 Ack 丢弃，
+		// 否则它会占满重试次数再进死信，制造无意义的告警。
 		return nil
 	}
 	if evt.UserID == 0 || evt.VideoID == 0 {
@@ -94,60 +52,10 @@ func (w *LikeWorker) process(ctx context.Context, body []byte) error {
 
 	switch evt.Action {
 	case "like":
-		return w.applyLike(ctx, evt.UserID, evt.VideoID)
+		return w.likes.ApplyLike(ctx, evt.UserID, evt.VideoID)
 	case "unlike":
-		return w.applyUnlike(ctx, evt.UserID, evt.VideoID)
+		return w.likes.ApplyUnlike(ctx, evt.UserID, evt.VideoID)
 	default:
 		return nil
 	}
-}
-
-func (w *LikeWorker) applyLike(ctx context.Context, userID, videoID uint) error {
-	ok, err := w.videos.IsExist(ctx, videoID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
-
-	created, err := w.likes.LikeIgnoreDuplicate(ctx, &video.Like{
-		VideoID:   videoID,
-		AccountID: userID,
-		CreatedAt: time.Now(),
-	})
-	if err != nil {
-		return err
-	}
-	if !created {
-		return nil
-	}
-
-	if err := w.videos.ChangeLikesCount(ctx, videoID, 1); err != nil {
-		return err
-	}
-	return w.videos.ChangePopularity(ctx, videoID, 1)
-}
-
-func (w *LikeWorker) applyUnlike(ctx context.Context, userID, videoID uint) error {
-	ok, err := w.videos.IsExist(ctx, videoID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
-
-	deleted, err := w.likes.DeleteByVideoAndAccount(ctx, videoID, userID)
-	if err != nil {
-		return err
-	}
-	if !deleted {
-		return nil
-	}
-
-	if err := w.videos.ChangeLikesCount(ctx, videoID, -1); err != nil {
-		return err
-	}
-	return w.videos.ChangePopularity(ctx, videoID, -1)
 }
