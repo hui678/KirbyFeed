@@ -1,6 +1,10 @@
-# 05 · 双 Token 鉴权与软硬鉴权
+# 05 · 双 Token 鉴权与软硬鉴权（专题）
 
-> 对象：`internal/auth/jwt.go` + `internal/account/*` + `internal/middleware/jwt/jwt.go` + `internal/worker/ssehub.go`（握手）+ 前端 `stores/auth.ts` / `api/client.ts`
+> 配套 Q&A：`15-双Token鉴权-面试QA.md`
+> 全局索引与代码锚点总表：`00-索引-面试文档地图.md`
+> **行号基准：2026-10-27**
+
+> 对象：`internal/auth/jwt.go` + `internal/account/*` + `internal/middleware/jwt/jwt.go` + `internal/worker/ssehub.go`（握手 + 定期复查）+ 前端 `stores/auth.ts` / `api/client.ts`
 > 目标：把「为什么这么设计」和「Redis 挂了会怎样」讲透，而不只是把代码念一遍。
 > 读完要能回答：**纯无状态 JWT 到底缺了什么？为什么判活要查 Redis？软鉴权和硬鉴权的边界在哪？Redis 不可用时哪几条链路会退化、退化成什么样？**
 
@@ -10,13 +14,13 @@
 
 | 文件 | 在本模块里的职责 |
 |---|---|
-| `internal/auth/jwt.go` | 签发/解析 Access Token（HS256 JWT）、生成 Refresh Token（随机串）；`AccessTokenTTL` / `RefreshTokenTTL` 两个常量是所有 TTL 的唯一来源 |
-| `internal/account/entity.go` | `Account` 表结构：`token` / `refresh_token`(索引) / `refresh_token_expiry` |
-| `internal/account/repo.go` | 纯 SQL：`Login`（覆盖写一行 = 一个会话）、`FindByRefreshToken`（索引等值查询）、`Logout`（清空两列） |
-| `internal/account/service.go` | 业务规则：验密码、发双 Token、双写、吊销（`revokeTokens`）、刷新（`RefreshAccessToken`） |
+| `internal/auth/jwt.go` | 签发/解析 Access Token（HS256 JWT）、生成 Refresh Token（随机串）、`HashRefreshToken`（SHA-256）；`AccessTokenTTL` / `RefreshTokenTTL` 两个常量是所有 TTL 的唯一来源 |
+| `internal/account/entity.go` | `Account` 表结构：`token` / `refresh_token`(哈希,索引) / `prev_refresh_token`(哈希,索引) / `refresh_rotated_at` / `refresh_token_expiry` |
+| `internal/account/repo.go` | 纯 SQL：`Login`（覆盖写一行 = 一个会话）、`RotateRefresh`（CAS 轮换）、`FindByRefreshToken`（current/prev 双匹配）、`Logout`（清空三列） |
+| `internal/account/service.go` | 业务规则：验密码、发双 Token、双写、吊销（`revokeTokens`）、刷新（`RefreshAccessToken`：轮换 + 重用检测 + 宽限重放） |
 | `internal/middleware/jwt/jwt.go` | `JWTAuth`（硬）、`SoftJWTAuth`（软）、`isActive`（判活）、`VerifyToken`（给 SSE 复用） |
 | `internal/http/router.go` | 决定哪些路由挂硬鉴权、哪些挂软鉴权、限流挂在哪 |
-| `internal/worker/ssehub.go` | SSE 握手复用 `VerifyToken`，避免长连接绕过吊销 |
+| `internal/worker/ssehub.go` | SSE 握手复用 `VerifyToken`，且长连接每 30s 复查一次，避免绕过吊销 |
 
 ---
 
@@ -49,8 +53,8 @@ JWT 解决的是**「不用查库就知道你是谁」**。它有三件事：
 | 形态 | HS256 JWT（自包含） | 32 字节随机数的 hex（不透明） |
 | TTL | 15 分钟 | 7 天 |
 | 谁校验 | 每个业务请求 | 只有 `/account/refresh` |
-| 存在哪 | MySQL `accounts.token` + Redis `account:{id}` | MySQL `accounts.refresh_token` + Redis `refresh:{token}` / `account:{id}:refresh` |
-| 泄漏影响 | 15 分钟（且可被即时吊销） | 7 天内可持续换 access，直到登出/改密 |
+| 存在哪 | MySQL `accounts.token` + Redis `account:{id}` | MySQL `accounts.refresh_token`（SHA-256）+ Redis `refresh:{哈希}` / `account:{id}:refresh` |
+| 泄漏影响 | 15 分钟（且可被即时吊销） | 用一次即轮换；旧票再出现超过 60s 即判定泄漏、整账号吊销 |
 | 为什么是这个形态 | 要走无状态校验，必须自包含 | 要能吊销、要能过期，不透明串最省心（没有签名可伪造，只能靠查库比对） |
 
 **为什么 Refresh 不是 JWT？** JWT 的价值是「不查库就能用」，而 Refresh 的每一次使用本来就必须查库（要判吊销、判过期）。用 JWT 反而多一层签名校验，还容易被误当成「无状态凭证」到处传。
@@ -63,25 +67,32 @@ JWT 解决的是**「不用查库就知道你是谁」**。它有三件事：
 
 ```mermaid
 flowchart LR
-    A["MySQL accounts 行<br/>token / refresh_token / refresh_token_expiry<br/>（权威，一行 = 一个会话）"]
-    B["Redis account:{id} = accessToken<br/>（快路径，TTL 24h）"]
-    C["Redis account:{id}:refresh = refreshToken<br/>（对称删除用，TTL 7d）"]
-    D["Redis refresh:{token} = accountID<br/>（反查键，TTL 7d）"]
+    A["MySQL accounts 行<br/>token / refresh_token(哈希) / prev_refresh_token(哈希)<br/>refresh_rotated_at / refresh_token_expiry<br/>（权威，一行 = 一个会话）"]
+    B["Redis account:{id} = accessToken<br/>（快路径，TTL = token 剩余寿命）"]
+    C["Redis account:{id}:refresh = refreshHash<br/>（对称删除用，TTL = refresh 剩余寿命）"]
+    D["Redis refresh:{refreshHash} = accountID<br/>（反查键，TTL = refresh 剩余寿命）"]
+    E["Redis refresh:issued:{旧哈希} = 新 refresh 明文<br/>（宽限重放用，TTL 60s）"]
     A -.登录/刷新时双写.-> B
     A -.登录/刷新时双写.-> C
-    A -.登录时双写.-> D
+    A -.登录/刷新时双写.-> D
+    A -.轮换后暂存.-> E
 ```
 
 | Key / 列 | 值 | TTL | 用途 |
 |---|---|---|---|
-| `account:{id}` | 当前 access token | 24h | 判活快路径（比 token 本身 15min 长，纯影子） |
-| `account:{id}:refresh` | 当前 refresh token | 7d | 登出/改密时对称删除 |
-| `refresh:{token}` | accountID | 7d | 刷新时 O(1) 反查，**避免对 refresh_token 做全表扫描** |
+| `account:{id}` | 当前 access token | **token 剩余寿命**（≤15m） | 判活快路径 |
+| `account:{id}:refresh` | 当前 refresh 的**哈希** | refresh 剩余寿命 | 登出/改密时对称删除 |
+| `refresh:{哈希}` | accountID | refresh 剩余寿命 | 刷新时 O(1) 反查，**避免对 refresh_token 做全表扫描** |
+| `refresh:issued:{上一张哈希}` | 轮换后新 refresh 的**明文** | 60s | 宽限期内幂等重放（库里只有哈希，无法还原明文） |
 | `accounts.token` | 当前 access token | — | 权威判活 + Redis 不可用时的回源 |
-| `accounts.refresh_token` | 当前 refresh token（`size:64;index`） | — | 权威比对 + 降级查询走索引 |
-| `accounts.refresh_token_expiry` | refresh 绝对过期时间 | — | **让「7 天」在 MySQL 侧也成立** |
+| `accounts.refresh_token` | 当前 refresh 的 **SHA-256**（`size:64;index`） | — | 权威比对 + 降级查询走索引 |
+| `accounts.prev_refresh_token` | 上一张 refresh 的 SHA-256（`size:64;index`） | — | 区分「弱网重试」与「泄漏重用」 |
+| `accounts.refresh_rotated_at` | 上次轮换时间 | — | 判定 60s 宽限期 |
+| `accounts.refresh_token_expiry` | refresh 绝对过期时间 | — | **让「7 天」在 MySQL 侧也成立**，轮换不延长 |
 
-为什么 `account:{id}` 的 TTL 是 24h 而不是 15min？它只是「当前生效 token 的影子」，token 自己带了 15 分钟 `exp`，JWT 解析那一步已经拦住了过期。TTL 给长一点是为了减少回源；真要吊销靠的是主动 `DEL`，不是等 TTL。
+为什么 `account:{id}` 的 TTL 取「token 剩余寿命」而不是固定 24h？它只是「当前生效 token 的影子」，token 自己带了 15 分钟 `exp`，JWT 解析那一步已经拦住了过期。TTL 不需要超过 `exp`——给更长只会延长「万一有脏值」的残留窗口（这是本次修掉的 P0 的兜底部分）。
+
+**为什么 refresh 落库存哈希？** refresh 是 256 bit 随机串，不存在字典攻击，SHA-256 足够且是微秒级；DB 或备份泄漏时攻击者拿到的哈希不能直接当凭证。Redis 反查键同样用哈希，连快照里都没有可用的明文。
 
 ---
 
@@ -90,9 +101,10 @@ flowchart LR
 ### 4.1 登录（`account/service.go` `Login`）
 
 ```text
-FindByUsername → bcrypt 比对 → 生成 access(15m) + refresh(7d)
-  → MySQL 覆盖写 token/refresh_token/refresh_token_expiry   ← 覆盖写 = 单会话互踢
-  → Redis 删旧 refresh 反查键 + 写三个新 key（失败只 log，不阻断登录）
+FindByUsername → bcrypt 比对 → 生成 access(15m) + refresh(7d) → refreshHash = sha256(refresh)
+  → MySQL 覆盖写 token/refresh_token(哈希)/prev=''/rotated_at=NULL/refresh_token_expiry
+                                                       ← 覆盖写 = 单会话互踢
+  → Redis 删旧 refresh 反查键 + 旧重放暂存 + 写三个新 key（失败只 log，不阻断登录）
 ```
 
 要点：**MySQL 写入成功就算登录成功**，Redis 是加速不是依赖。订单是「先权威后影子」，所以 Redis 抖动不会让登录 500。
@@ -116,25 +128,40 @@ flowchart TD
 ### 4.3 刷新（`account/service.go` `RefreshAccessToken`）
 
 ```text
-1) Redis 主路径：GET refresh:{token} → accountID        （O(1)，TTL 天然表达 7 天）
-2) Redis 未命中/不可用 → MySQL 降级：FindByRefreshToken  （refresh_token 上的二级索引）
-3) 两条路径汇合后统一校验：accounts.refresh_token == 传入 且 未过 refresh_token_expiry
-4) 签发新 access → MySQL UpdateToken → 回填 Redis account:{id}
+RefreshAccessToken(raw):
+  presented = sha256(raw)
+1) Redis 主路径：GET refresh:{presented} → accountID            （O(1)）
+2) Redis 未命中/不可用 → MySQL 降级：FindByRefreshToken(current OR prev)（二级索引）
+3) 两条路径汇合后统一校验：presented ∈ {current, prev} 且 未过 refresh_token_expiry
+4) 分支：
+   - presented == current：
+       CAS: UPDATE ... SET refresh_token=newHash, prev_refresh_token=presented, refresh_rotated_at=now
+            WHERE id=? AND refresh_token=presented
+       成功 → 签新 access → 删旧反查键 → 写新反查键 → 暂存新 refresh 明文 60s
+       失败(RowsAffected=0) → 重读：prev==presented 且刚轮换 → 60s 内幂等重放；否则 ErrRefreshInvalid
+   - presented == prev：
+       60s 内 → 幂等重放（不再轮换）
+       超 60s → 判定泄漏 → revokeTokens 整账号吊销 → ErrRefreshReuse
 ```
 
-三个设计点：
+四个设计点：
 
 - **必须保留第 3 步的 MySQL 比对。** 只信 Redis 反查键的话，一旦登出时 `DEL` 失败，被吊销的 refresh 就能继续换 access。
+- **轮换必须用 CAS，不能先查再改。** `WHERE refresh_token = 旧值` 让「判断」和「写入」在同一条 SQL 里原子完成；先查后改会让两个并发请求各自通过判断、各换一张新票。
 - **降级路径不能全表扫描。** 旧实现是 `FindAll()` 把所有账号读进内存再 `for` 比对，refresh 频率一高就是 DB 灾难（顺带把全表密码哈希读进内存）。
 - **两条路径都要回填 `account:{id}`。** 旧实现的降级分支漏了回填，导致降级成功后每个请求都要回源 MySQL 判活。
+
+**宽限期（60s）为什么存在：** 客户端没收到响应、多标签页并发刷新时，旧票重试是正常行为。宽限内用 `refresh:issued:{prevHash}` 里暂存的新 refresh 明文幂等重放同一份结果；超过宽限期才判定泄漏。代价是这 60 秒内攻击者持旧票也能重放，窗口刻意取短。重放时 access 优先复用 MySQL 里未过期的旧值，避免每次重试都顶掉上一张。
 
 ### 4.4 登出 / 改密（`revokeTokens`）
 
 ```text
-mustClear(account:{id})           一级 DEL → 二级重试 → 三级写空哨兵
-mustClear(account:{id}:refresh)   同上
-mustClear(refresh:{旧refresh})    同上
-MySQL 清空 token + refresh_token  → 失败则报错
+mustClear(account:{id})                一级 DEL → 二级重试 → 三级写空哨兵
+mustClear(account:{id}:refresh)        同上
+mustClear(refresh:{当前 refresh 哈希})  同上
+mustClear(refresh:{上一张哈希})         同上
+mustClear(refresh:issued:{...})        同上（宽限重放暂存也要清）
+MySQL 清空 token + refresh_token + prev_refresh_token → 失败则报错
 
 改密额外一步：bcrypt 验旧密码 → 写新密码 → revokeTokens（改密即吊销）
 ```
@@ -195,6 +222,7 @@ if err := cache.SetBytes(ctx, key, []byte(token), auth.AccessTokenTTL); err != n
 配套三条约束：
 
 1. **所有会改写 `accounts.token` 的路径**都要收敛到这两个 helper：`Login`（覆盖写）/ `RefreshAccessToken`（`UpdateToken`）/ `Rename`（重签）/ `Logout`（清空）/ 改密 → `revokeTokens`。漏一条就漏一个洞口。
+   - `Rename` 还有半件事：`videos.username` 是反范式冗余，必须在**同一个事务**里一起改，提交后再按受影响视频 ID 失效实体缓存（`videocache.Invalidate`）。否则用户主页是新名字，历史视频卡片永久显示旧名字。
 2. **快路径 TTL 从固定 24h 改为「token 剩余寿命」**（`tokenRemainingTTL`）：万一再出现不一致，残留窗口上限是 15 分钟而非 24 小时。这是最后一道兜底。
 3. `Logout` 的「MySQL 已空就提前 return」分支**必须先补一次 Redis 清理**，否则上一次清理失败留下的脏值会赖到 TTL 到期。
 
@@ -204,13 +232,15 @@ if err := cache.SetBytes(ctx, key, []byte(token), auth.AccessTokenTTL); err != n
 
 `postJson` 在收到 401 时（且不是刷新接口本身）触发一次 `tryRefresh()`，成功后用新 token 重放原请求；并发请求共享同一个 `refreshPromise`，避免惊群。刷新失败 → `clearTokens()`。
 
+**轮换上线后前端必须同步改的一行：** 刷新响应里会带新的 `refresh_token`，必须和 access 一起写回（`client.ts:53` 的 `setTokens`）。只更新 access 的话，下一次刷新会拿旧票 —— 而旧票已经进了 `prev`，超过 60s 就会触发 reuse detection，把用户直接踢下线。
+
 ---
 
 ## 5. 软硬鉴权：一张表看清边界
 
 |  | `JWTAuth`（硬） | `SoftJWTAuth`（软） |
 |---|---|---|
-| 用在哪 | 写接口、必须登录才能看的接口（点赞/评论/关注/上传/私信/登出/改密…） | `/feed` 公开列表（listLatest / listLikesCount / listByPopularity / listByTag） |
+| 用在哪 | 写接口、必须登录才能看的接口（点赞/评论/关注/上传/私信/登出/改密…） | `/feed` 公开列表（listLatest / listByPopularity / listTags / listByTag） |
 | 无 Authorization | 401 | 匿名放行 |
 | token 过期 / 签名非法 | 401 | **匿名放行** |
 | token 已吊销 | 401 | **匿名放行** |
@@ -232,7 +262,9 @@ if err := cache.SetBytes(ctx, key, []byte(token), auth.AccessTokenTTL); err != n
 |---|---|---|---|
 | 登录 | 双写 | 跳过 Redis 写（仅 log），MySQL 照写 | ✅ |
 | 判活鉴权 | `GET account:{id}` 命中比对 | 每次回源 MySQL 主键查询 + 回填（回填失败仅 log） | ✅（退化：每请求 1 次 SQL） |
-| 刷新 | `GET refresh:{token}` 反查 | `FindByRefreshToken` 索引查询 | ✅（退化：1 次索引 SQL） |
+| 刷新 | `GET refresh:{哈希}` 反查 | `FindByRefreshToken` 索引查询（current OR prev） | ✅（退化：1 次索引 SQL） |
+| 刷新轮换 | CAS + 写新反查键 | CAS 照常（MySQL 权威）；反查键缺失只是下次多一次索引查询 | ✅ |
+| 宽限期重放 | `refresh:issued:{prev}` 命中 | 暂存丢失 → 无法还原新 refresh → 返回 invalid，客户端重登 | ⚠️ 降级（60s 内丢响应的重试会失败） |
 | 登出 / 改密 | 删 Redis + 清 MySQL | 只清 MySQL | ✅ 吊销仍即时 |
 | **Redis 写得一半失败**（DEL/SET 报错但服务仍在） | 正常读写 | — | ⚠️ 靠 `mustClear` 三级降级 + `setCurrentToken` 回退删除兜住（见 4.4-bis） |
 | refresh 过期 | Redis TTL + MySQL expiry 双保险 | MySQL `refresh_token_expiry` 兜底 | ✅（这是补 `refresh_token_expiry` 列的原因） |
@@ -245,11 +277,11 @@ if err := cache.SetBytes(ctx, key, []byte(token), auth.AccessTokenTTL); err != n
 
 ## 7. 已知取舍（面试必问，必须自己先说）
 
-1. **刷新时不轮换 Refresh Token。** 换发的只有 access，refresh 原样用满 7 天。好处是刷新链路简单、前端不用处理「并发刷新时两个请求拿着新旧 refresh 打架」的竞态；代价是 refresh 泄漏后在剩余生命周期内持续可用，且**没有 reuse detection**（检测不到「同一个 refresh 被两地使用」这种被盗特征）。要补的话需要引入 refresh token 家族表 + 重放检测。
+1. **轮换有 60 秒宽限期。** 每次刷新 CAS 换新票，旧票进 `prev_refresh_token`；旧票在 60s 内再次出现按「弱网重试/并发刷新」处理，幂等重放同一份新凭证。代价是这 60 秒内攻击者持旧票也能重放；收益是正常用户不会被误判泄漏。超期重用则整账号吊销。
 2. **判活让每次鉴权多一次 Redis GET。** 换来了即时吊销。QPS 高时可以叠加进程内短 TTL 本地缓存（代价是吊销最多延迟一个 TTL），本项目没做。
 3. **Refresh 走的是「先查后比」而不是「只查」。** 多一次主键查询，换来吊销/互踢的确定性。
-4. **单会话模型。** 一行 `accounts` 只存一张 token，天然互踢；代价是不支持多端同时在线（要支持得把 token 拆成独立会话表）。
-5. **SSE 只在握手时校验一次。** 长连接期间 token 过期或被动吊销不会主动踢连接（Hub 是进程内 map，多实例下推送也收不全）。
+4. **单会话模型。** 一行 `accounts` 只存一张 token，天然互踢；没有 `family_id`，因为「家族」就是 current + prev 两列。代价是不支持多端同时在线（要支持得把 token 拆成独立会话表 + `sid` claim）。
+5. **SSE 每 30 秒复查一次凭证。** 握手时 `VerifyToken`（签名 + 吊销），连接存续期间用 `Ticker` 定时复查；失败即结束 handler，客户端凭新 token 重连。剩余限制是 Hub 仍是进程内 map（多实例下推送收不全，需要 Redis Pub/Sub 或 sticky 路由），且**本项目前端尚未接入 SSE 消费端**，这条目前是服务端能力。
 
 ---
 
@@ -272,6 +304,15 @@ Access 短 = 泄漏后损失窗口小、且吊销前最多残留 15 分钟；Ref
 
 **Q：Redis 里有旧 token、MySQL 里是新 token，判活怎么处理？**
 回源 MySQL 以它为准，通过后再回填 Redis。绝不直接拒绝——那会把「Redis 写失败」放大成「用户被踢下线」。
+
+**Q：两个请求同时刷新，会不会各拿一张新 refresh？**
+不会。轮换是 CAS：`UPDATE ... WHERE refresh_token = 旧哈希`，只有一个请求的 `RowsAffected=1`。输家重读账号行，看到 `prev_refresh_token == 自己手里的旧票` 且在 60s 宽限期内，就从 `refresh:issued:{旧哈希}` 里取出赢家刚换出的新 refresh，幂等重放同一份结果。两个请求要么拿到同一份凭证，要么输家失败重试。
+
+**Q：为什么 refresh token 落库要存哈希，而 access 存原值？**
+access 本身就是 JWT 字符串，服务端要拿它和请求头里的原值做全等比对，必须存原值；而 refresh 是随机串，服务端只需要「等值判断」，存 `sha256(传入值)` 就能完成比对，DB 泄漏后攻击者拿不到可用凭证。两者目的不同：access 那一列是「判活比对」，refresh 那一列是「持有性证明」。
+
+**Q：reuse detection 检测到旧票重放，为什么把用户也一起踢下线？**
+因为服务端无法区分谁是攻击者。只踢「当前票」的话，如果攻击者已经拿旧票换走了一张新票，用户的正常票反而先被作废。整账号吊销是「无法分辨时让双方都重新认证」，再由用户重登把攻击者彻底挤掉；同时打 `SECURITY` 日志作为告警信号。
 
 **Q：软鉴权把过期 token 当匿名，用户会不会看到「已登录却没个性化数据」？**
 会，这是刻意的：宁可降级成匿名体验，也不让公开内容整页 500/401。前端同时用 `exp` 提前判定登录态（`stores/auth.ts` 的 `isLoggedIn`），把「过期」在 UI 上就表现出来，而不是等 401。
@@ -298,8 +339,23 @@ Access 短 = 泄漏后损失窗口小、且吊销前最多残留 15 分钟；Ref
 | 11 | 前端登录态只看 token 存在 | 过期仍显示已登录 | `isLoggedIn` 判 `exp` + 30s 心跳；改密后主动清 token |
 | **12** | **Redis 残旧值导致吊销/互踢失效**（P0） | 判活「命中即放行」短路 + 写 Redis 失败只 log → MySQL 吊销后旧 token 最长还能用 24h | `setCurrentToken`（写失败回退删除）+ `mustClear`（DEL→重试→空哨兵三级降级）；五条改 token 的路径全部收敛；快路径 TTL 改为 token 剩余寿命；重复登出补清 Redis；`isActive` 显式排斥空值 |
 | **13** | 快路径缓存 TTL 24h 过长 | 一旦残留脏值，窗口 24 小时 | `tokenRemainingTTL` 取到期的剩余时间，窗口上限压到 15 分钟 |
+| **14** | refresh 明文落库、可重放 | `refresh_token` 存明文，且同一张票可无限次换 access | 落库/反查键改存 SHA-256；每次刷新 `RotateRefresh` CAS 轮换，旧票进 `prev_refresh_token` |
+| **15** | 无重用检测 | 旧 refresh 被两地使用无法发现 | 旧票超过 60s 宽限期再次出现 → `revokeTokens` 整账号吊销 + `SECURITY` 日志 |
+| **16** | 并发刷新各换一张 | 先查后改，两个请求都成功 | CAS `WHERE refresh_token = 旧哈希`；输家重读后宽限期内幂等重放 |
+| **17** | 刷新接口无限流 | 可被暴力尝试/批量重放 | `30 次/分/IP` 限流（`router.go:36,54`） |
+| **18** | SSE 长连接只握手校验 | 登出/改密后已建立的连接仍能收推送 | 握手 `VerifyToken` + 每 30s `Ticker` 复查，失败即断开 |
+| **19** | 关键路径无回归测试 | 吊销逻辑靠人肉推演 | 新增 `account/service_test.go`（缓存降级 3 条）、`refresh_test.go`（轮换/重放/重用 5 条）、`jwt_test.go`（判活 4 条） |
 
-仍**未修**且值得记一下的：refresh 不轮换 / 无 reuse detection；`/account/refresh` 自身无限流；SSE 长连接期间不复查；头像上传只校验扩展名；**这套吊销逻辑没有自动化测试覆盖**（建议补一个 Redis 写失败场景的回归用例）。
+> **升级注意（哈希落库的迁移）**：旧库里的 `refresh_token` 是明文，新代码比对的是 `sha256(传入值)`，所以直接上线会让存量 refresh 全部失配（等价于所有人强制重登一次）。能接受就接受；不能接受就先跑一次性迁移：`UPDATE accounts SET refresh_token = SHA2(refresh_token, 256) WHERE refresh_token <> ''`。新列由 `AutoMigrate` 自动添加。
+
+仍**未修**且值得记一下的：
+
+- 头像上传只校验扩展名，不校验内容/尺寸；
+- 多设备仍不支持（需 sessions 表 + `sid` claim）；
+- 回源没有限流/熔断（Redis 全挂时 DB 会被放大）；
+- 刷新接口只有 IP 限流，没有按账号的异常刷新风控；
+- reuse detection 只打日志，未接告警；
+- 测试只到单元层：没有 MySQL 集成测试、主从延迟复现和端到端压测。
 
 ---
 
@@ -318,9 +374,17 @@ curl -s -X POST localhost:8080/feed/listLatest -H 'Content-Type: application/jso
 curl -s -X POST localhost:8080/feed/listLatest -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <已过期的token>' -d '{"limit":5}'
 
-# 4) 刷新
+# 4) 刷新：响应里的 refresh_token 应与旧票不同（轮换）
 curl -s -X POST localhost:8080/account/refresh -H 'Content-Type: application/json' \
-  -d '{"refresh_token":"<refresh>"}'
+  -d '{"refresh_token":"<旧 refresh>"}'
+
+# 4-bis) 60 秒内用同一张旧票再刷 → 200，且返回与上一步完全相同的新凭证（幂等重放）
+curl -s -X POST localhost:8080/account/refresh -H 'Content-Type: application/json' \
+  -d '{"refresh_token":"<旧 refresh>"}'
+
+# 4-ter) 等 61 秒后再用旧票 → 401，且账号当前 access/refresh 一起失效（reuse detection）
+curl -s -X POST localhost:8080/account/refresh -H 'Content-Type: application/json' \
+  -d '{"refresh_token":"<旧 refresh>"}'
 
 # 5) 登出后旧 access 立刻失效（硬鉴权 401 / 软鉴权降级匿名）
 curl -s -X POST localhost:8080/account/logout -H 'Authorization: Bearer <access>'
@@ -328,4 +392,4 @@ curl -s -X POST localhost:8080/like/isLiked -H 'Content-Type: application/json' 
   -H 'Authorization: Bearer <access>' -d '{"video_id":1}'   # → 401
 ```
 
-把 Redis 停掉再跑一遍 1→5，除了 SSE 与限流外其余链路都应照常工作，只是日志里出现 `failed to set cache` / `failed to del cache`——这正是降级路径被触发的证据。
+把 Redis 停掉再跑一遍 1→5：鉴权与刷新会回源 MySQL（只是变慢），限流 fail-open，SSE 握手仍能通过 `VerifyToken` 回源；但 4-bis 的宽限重放会失败（暂存依赖 Redis），日志里出现 `failed to set cache` / `failed to del cache`——这正是降级路径被触发的证据。

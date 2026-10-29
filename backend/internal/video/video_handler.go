@@ -5,15 +5,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
-	"os"
-	"path"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"feedsystem_video_go/internal/account"
 	"feedsystem_video_go/internal/apierror"
 	"feedsystem_video_go/internal/middleware/jwt"
+	"feedsystem_video_go/internal/storage"
 
 	"github.com/gin-gonic/gin"
 )
@@ -21,10 +19,11 @@ import (
 type VideoHandler struct {
 	service        *VideoService
 	accountService *account.AccountService
+	storage        storage.Storage
 }
 
-func NewVideoHandler(service *VideoService, accountService *account.AccountService) *VideoHandler {
-	return &VideoHandler{service: service, accountService: accountService}
+func NewVideoHandler(service *VideoService, accountService *account.AccountService, storage storage.Storage) *VideoHandler {
+	return &VideoHandler{service: service, accountService: accountService, storage: storage}
 }
 
 func (vh *VideoHandler) PublishVideo(c *gin.Context) {
@@ -79,39 +78,38 @@ func (vh *VideoHandler) UploadVideo(c *gin.Context) {
 		return
 	}
 
-	ext := strings.ToLower(filepath.Ext(f.Filename))
+	ext := strings.ToLower(getExt(f.Filename))
 	if ext != ".mp4" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "only .mp4 is allowed"})
 		return
 	}
 
-	date := time.Now().Format("20060102")
-	relDir := filepath.Join("videos", fmt.Sprintf("%d", authorId), date)
-	root := filepath.Join(".run", "uploads")
-	absDir := filepath.Join(root, relDir)
-	if err := os.MkdirAll(absDir, 0o755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	filename, err := randHex(16)
+	key, err := buildMediaKey("videos", authorId, ext)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate filename"})
 		return
 	}
-	filename = filename + ext
-	absPath := filepath.Join(absDir, filename)
 
-	if err := c.SaveUploadedFile(f, absPath); err != nil {
+	src, err := f.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
+	defer src.Close()
+
+	if err := vh.storage.Put(c.Request.Context(), key, src, f.Size, "video/mp4"); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	urlPath := path.Join("/static", "videos", fmt.Sprintf("%d", authorId), date, filename)
-
+	url, err := vh.storage.Resolve(c.Request.Context(), key)
+	if err != nil {
+		url = key
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"url":      buildAbsoluteURL(c, urlPath),
-		"play_url": buildAbsoluteURL(c, urlPath),
+		"key":      key,
+		"url":      url,
+		"play_url": url,
 	})
 }
 
@@ -134,7 +132,7 @@ func (vh *VideoHandler) UploadCover(c *gin.Context) {
 		return
 	}
 
-	ext := strings.ToLower(filepath.Ext(f.Filename))
+	ext := strings.ToLower(getExt(f.Filename))
 	switch ext {
 	case ".jpg", ".jpeg", ".png", ".webp":
 	default:
@@ -142,33 +140,32 @@ func (vh *VideoHandler) UploadCover(c *gin.Context) {
 		return
 	}
 
-	date := time.Now().Format("20060102")
-	relDir := filepath.Join("covers", fmt.Sprintf("%d", authorId), date)
-	root := filepath.Join(".run", "uploads")
-	absDir := filepath.Join(root, relDir)
-	if err := os.MkdirAll(absDir, 0o755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	filename, err := randHex(16)
+	key, err := buildMediaKey("covers", authorId, ext)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate filename"})
 		return
 	}
-	filename = filename + ext
-	absPath := filepath.Join(absDir, filename)
 
-	if err := c.SaveUploadedFile(f, absPath); err != nil {
+	src, err := f.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
+	defer src.Close()
+
+	if err := vh.storage.Put(c.Request.Context(), key, src, f.Size, contentTypeOf(ext)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	urlPath := path.Join("/static", "covers", fmt.Sprintf("%d", authorId), date, filename)
-
+	url, err := vh.storage.Resolve(c.Request.Context(), key)
+	if err != nil {
+		url = key
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"url":       buildAbsoluteURL(c, urlPath),
-		"cover_url": buildAbsoluteURL(c, urlPath),
+		"key":       key,
+		"url":       url,
+		"cover_url": url,
 	})
 }
 
@@ -180,15 +177,52 @@ func randHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func buildAbsoluteURL(c *gin.Context, p string) string {
-	scheme := "http"
-	if c.Request.TLS != nil {
-		scheme = "https"
+func getExt(name string) string {
+	idx := strings.LastIndexByte(name, '.')
+	if idx < 0 {
+		return ""
 	}
-	if xf := c.GetHeader("X-Forwarded-Proto"); xf != "" {
-		scheme = xf
+	return name[idx:]
+}
+
+func contentTypeOf(ext string) string {
+	switch ext {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	case ".mp4":
+		return "video/mp4"
+	default:
+		return "application/octet-stream"
 	}
-	return fmt.Sprintf("%s://%s%s", scheme, c.Request.Host, p)
+}
+
+// buildMediaKey 生成稳定的对象 key：{dir}/{authorId}/{yyyyMMdd}/{rand}{ext}。
+// 这个 key 会落库（video.play_url / cover_url 等），读取时再解析成可访问 URL。
+func buildMediaKey(dir string, authorId uint, ext string) (string, error) {
+	filename, err := randHex(16)
+	if err != nil {
+		return "", err
+	}
+	date := time.Now().Format("20060102")
+	return fmt.Sprintf("%s/%d/%s/%s%s", dir, authorId, date, filename, ext), nil
+}
+
+// resolveVideoURLs 把视频实体里的 key（play_url/cover_url）就地解析成可访问 URL。
+// 必须在「响应边界」做，不能落库——预签名 URL 会过期。
+func (vh *VideoHandler) resolveVideoURLs(c *gin.Context, v *Video) {
+	if v == nil {
+		return
+	}
+	if u, err := vh.storage.Resolve(c.Request.Context(), v.PlayURL); err == nil {
+		v.PlayURL = u
+	}
+	if u, err := vh.storage.Resolve(c.Request.Context(), v.CoverURL); err == nil {
+		v.CoverURL = u
+	}
 }
 
 func (vh *VideoHandler) DeleteVideo(c *gin.Context) {
@@ -223,6 +257,9 @@ func (vh *VideoHandler) ListByAuthorID(c *gin.Context) {
 	if videos == nil {
 		videos = []Video{}
 	}
+	for i := range videos {
+		vh.resolveVideoURLs(c, &videos[i])
+	}
 	c.JSON(200, videos)
 }
 
@@ -237,6 +274,7 @@ func (vh *VideoHandler) GetDetail(c *gin.Context) {
 		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
 		return
 	}
+	vh.resolveVideoURLs(c, video)
 	c.JSON(200, video)
 }
 

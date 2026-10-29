@@ -29,6 +29,12 @@ type ChunkUploadSession struct {
 	ChunkSize   int64  `json:"chunk_size"`
 	TotalChunks int    `json:"total_chunks"`
 	FileHash    string `json:"file_hash"`
+
+	// OSS 分片直传相关（仅当后端支持 multipart 时填充）。
+	// OSSUploadID 非空即表示本次会话走「客户端直传 OSS + 服务端拷贝合并」模式；
+	// FinalKey 是合并后最终对象的 key（同时落库为 video.play_url）。
+	OSSUploadID string `json:"oss_upload_id,omitempty"`
+	FinalKey    string `json:"final_key,omitempty"`
 }
 
 // ExpectedChunkSize 返回第 index 片应有的精确字节数；越界或参数非法返回 -1。

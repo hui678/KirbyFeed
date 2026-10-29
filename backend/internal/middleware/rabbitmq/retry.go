@@ -29,9 +29,12 @@ func RetryRoutingKey(mainQueue string) string { return mainQueue + retryQueueSuf
 //	    <mainQueue>.retry: x-message-ttl=ttl, x-dead-letter-exchange=<mainExchange>
 //
 // 关键点：重试队列**故意不设** x-dead-letter-routing-key。
-// RabbitMQ 的规则是「没指定死信路由键时沿用消息原始 routing key」，
-// 于是 TTL 到期后消息会带着原始的 `like.like` / `comment.publish` 回到主交换机，
-// 再被主队列的绑定键接住，天然完成一次重投，且不需要重新计算路由键。
+// RabbitMQ 的规则是「没指定死信路由键时沿用消息当前的 routing key」，
+// 于是 TTL 到期后消息会带着 PublishRetry 写入的 `<mainQueue>.retry` routing key
+// 回到主交换机；为了让主队列能接住它、完成一次自动重投，下面额外把主队列
+// 也绑定到 `RetryRoutingKey(mainQueue)`（见末尾的 QueueBind）。
+// 这样既不需要重新计算路由键，也不会因为主队列只绑了 `like.*` 之类、
+// 而 `<mainQueue>.retry` 是三段式导致消息不可路由被静默丢弃。
 func DeclareRetry(ch *amqp.Channel, mainExchange, mainQueue string, ttl time.Duration) error {
 	if ch == nil {
 		return errors.New("channel is not initialized")
@@ -65,6 +68,11 @@ func DeclareRetry(ch *amqp.Channel, mainExchange, mainQueue string, ttl time.Dur
 		return err
 	}
 	if err := ch.QueueBind(retryQueue, RetryRoutingKey(mainQueue), RetryExchange, false, nil); err != nil {
+		return err
+	}
+	// 主队列额外绑定重试 routing key：重试队列 TTL 到期死信回来时，消息携带
+	// `<mainQueue>.retry` 路由键，主队列凭此接住它，完成一次自动重投。
+	if err := ch.QueueBind(mainQueue, RetryRoutingKey(mainQueue), mainExchange, false, nil); err != nil {
 		return err
 	}
 	log.Printf("retry topology ready: queue=%s ttl=%v -> %s", retryQueue, ttl, mainExchange)

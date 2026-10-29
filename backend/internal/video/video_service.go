@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
 	"feedsystem_video_go/internal/apierror"
+	"feedsystem_video_go/internal/dbguard"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 
@@ -101,6 +103,17 @@ func (vs *VideoService) Delete(ctx context.Context, id uint, authorID uint) erro
 	}
 	// 与 Feed 批量读取共用同一份实体缓存
 	InvalidateVideoEntity(context.Background(), vs.cache, id)
+
+	// 从热时间线移除，避免已删除视频继续占用当页名额。
+	// Redis 失败不回滚删除：源数据已经没了，读路径装配时也会把它过滤掉，
+	// 这里只是让页更满；残留项由后台对账与空 ZSET 重建兜底。
+	if vs.cache != nil {
+		opCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		if err := vs.cache.ZRem(opCtx, TimelineZSetKey(vs.cache), strconv.FormatUint(uint64(id), 10)); err != nil {
+			log.Printf("删除视频后移除热时间线失败: video=%d err=%v", id, err)
+		}
+		cancel()
+	}
 	return nil
 }
 
@@ -134,14 +147,13 @@ func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) 
 		return &cached, true
 	}
 
-	setCached := func(video *Video) {
+	setCached := func(video *Video, version string) {
 		b, err := json.Marshal(video)
 		if err != nil {
 			return
 		}
-		opCtx, cancel := context.WithTimeout(ctx, singleRedisOpTimeout)
-		defer cancel()
-		_ = vs.cache.SetBytes(opCtx, cacheKey, b, vs.cacheTTL)
+		// 版本 CAS：回源期间如果发生过失效，这次回写就携带了旧值，必须丢弃。
+		SetVideoEntityIfVersion(ctx, vs.cache, video.ID, b, vs.cacheTTL, version)
 	}
 
 	if vs.cache != nil {
@@ -162,8 +174,17 @@ func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) 
 				return v, nil
 			}
 
-			video, err := vs.repo.GetByID(ctx, id)
-			if err != nil {
+			// 版本号必须在查库之前读取：失效可能发生在「查库之后、回写之前」，
+			// 那种情况下查回的是旧值，CAS 必须失败。读不到版本（Redis 故障）时
+			// 只查库、不回写，因为比较基准不可信。
+			version, versionOK := EntityVersion(ctx, vs.cache, id)
+
+			var video *Video
+			if err := dbguard.Do(func() error {
+				var e error
+				video, e = vs.repo.GetByID(ctx, id)
+				return e
+			}); err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					// 记下「这个 ID 确定不存在」，否则同一个不存在的 ID 每次请求
 					// 都会打一次 MySQL（缓存穿透）。短 TTL，数据补上后自动恢复。
@@ -171,7 +192,9 @@ func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) 
 				}
 				return (*Video)(nil), err
 			}
-			setCached(video)
+			if versionOK {
+				setCached(video, version)
+			}
 			return video, nil
 		})
 		if err != nil {
@@ -184,8 +207,12 @@ func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) 
 		return &safeCopy, nil
 	}
 
-	video, err := vs.repo.GetByID(ctx, id)
-	if err != nil {
+	var video *Video
+	if err := dbguard.Do(func() error {
+		var e error
+		video, e = vs.repo.GetByID(ctx, id)
+		return e
+	}); err != nil {
 		return nil, err
 	}
 	return video, nil

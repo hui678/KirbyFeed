@@ -1,7 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
 import HomeView from '../views/HomeView.vue'
-import HotView from '../views/HotView.vue'
 import VideoView from '../views/VideoView.vue'
 import VideoDetailView from '../views/VideoDetailView.vue'
 import AccountView from '../views/AccountView.vue'
@@ -17,7 +16,7 @@ const router = createRouter({
   routes: [
     { path: '/', name: 'home', component: HomeView },
     { path: '/feed', redirect: '/' },
-    { path: '/hot', name: 'hot', component: HotView },
+    { path: '/hot', redirect: { path: '/', query: { tab: 'hot' } } },
     { path: '/video', name: 'video', component: VideoView, meta: { requiresAuth: true } },
     { path: '/video/:id', name: 'video-detail', component: VideoDetailView, props: true },
     { path: '/account', name: 'account', component: AccountView },

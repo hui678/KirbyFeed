@@ -35,20 +35,20 @@ P1｜Outbox 依赖 MQ 初始非 nil：API 降级启动时 poller 无法工作，
 P2｜ZSET 只保留 1000 条：深分页要回源 DB，热区与冷区拼接的边界容易重复/漏项；热榜/时间线的“冷热分离”只覆盖了前 1000 条。
 P2｜时间线消费者在 API 进程：与“双进程”叙事不一致；API 重启或扩容会直接影响时间线构建。
 四、滑动窗口热榜
-P0 ✅已修｜DB 回退分页是坏的：前端 listByPopularity 只传 limit/as_of/offset，不传 DB 回退 cursor，Redis 不可用时 HotView 的“加载更多”会重复第一页。修复：① 前端保存并回传 next_latest_popularity/latest_before/latest_id_before 三元组；② 后端降级路径增加保护——offset > 0 且游标缺失时返回空 + has_more=false，绝不带着空游标从头查。
+P0 ✅已修｜DB 回退分页是坏的：前端 listByPopularity 只传 limit/as_of/offset，不传 DB 回退 cursor，Redis 不可用时热榜的“加载更多”会重复第一页。修复：① 前端保存并回传 next_latest_popularity/latest_before/latest_id_before 三元组；② 后端降级路径增加保护——offset > 0 且游标缺失时返回空 + has_more=false，绝不带着空游标从头查。
 feed/service.go:427-533
 、
 frontend/src/api/feed.ts
 、
-frontend/src/views/HotView.vue
-P1 ✅已修｜offset 按 items.length 推进：视频被删除时 len(items) < len(members)，推进少了会让下一页重复一条。已改为按 len(members) 推进，has_more 同理。（原描述中“DB 只按点赞数排序”有误：repo.go 实际按 popularity DESC, create_time DESC, id DESC 排序，按点赞数排的是另一个接口 listLikesCount。）
+frontend/src/components/HotRankPanel.vue
+P1 ✅已修｜offset 按 items.length 推进：视频被删除时 len(items) < len(members)，推进少了会让下一页重复一条。已改为按 len(members) 推进，has_more 同理。（原描述中“DB 只按点赞数排序”有误：repo.go 实际按 popularity DESC, create_time DESC, id DESC 排序。）
 P1｜快照过期后 offset 语义断裂：下一页按新的 as_of 重建快照，但没有版本校验；快照被淘汰时用户会看到“翻页前后不是同一份榜”。
 P1｜PopularityWorker 吞掉 Redis 错误后照样 Ack：Redis 故障期间热度事件静默丢失，热榜不会“最终一致”。
 popularityworker.go
 、
 popularity_cache.go
 P2｜分钟桶合并成本随窗口线性增长：每次请求都 ZUNIONSTORE 多个分钟 key，没有合并结果缓存或窗口上限保护。
-P2｜主 feed 的“热”tab 不是滑动热榜：它实际用 listLikesCount（点赞总数）排序，滑动热榜只在 HotView 一处使用；产品入口和简历描述不一致。
+P2 ✅已修｜首页「热」tab 已改为真正的滑动窗口热榜（HotRankPanel 调 listByPopularity），点赞榜接口已整体删除；推荐/关注/热榜/话题四个 tab 并列。
 useVideoFeed.ts
 五、事件驱动与最终一致
 P0｜LikeWorker 不是事务，重试会永久丢计数：插点赞行、更新计数、发热度事件不在一个事务；如果插行成功、计数失败，重试时 duplicate 直接跳过，计数再也补不回来；3 次失败后 Ack 丢弃，不进 DLX。
@@ -158,15 +158,15 @@ UserProfileView.vue
 P2｜normalizeAccount 丢弃 avatar/bio：个人资料页信息丢失，头像/简介加载不出来。
 P2｜改密成功后不清理本地 token：页面跳回登录页，但 isLoggedIn 仍可能为 true，直到下一次 401。
 ChangePasswordView.vue
-P2 ✅已修｜热榜“加载更多”在 Redis 不可用时重复第一页：同热榜 P0，前端已在 feed.ts / HotView.vue 回传 DB 回退 cursor。
+P2 ✅已修｜热榜“加载更多”在 Redis 不可用时重复第一页：同热榜 P0，前端已在 feed.ts / HotRankPanel.vue 回传 DB 回退 cursor。
 feed.ts
 、
-HotView.vue
+HotRankPanel.vue
 P2 ⚠️部分修正｜上传无整体超时/取消/自动续传：client.ts 已支持 `timeoutMs` + AbortController，分片上传已带超时与退避重试，合并前会自动按 status 补传缺失分片；仍缺“取消/暂停”按钮与会话级自动恢复。
 client.ts
 、
 VideoView.vue
-P2｜主 feed 的“热”tab 是点赞榜：不是滑动窗口热榜；推荐/关注游标单位不同，前端各自处理，契约脆弱。
+P2 ✅已修｜首页「热」tab 已是滑动窗口热榜；推荐/关注用各自的复合游标，热榜/话题各自维护分页状态，互不干扰。
 useVideoFeed.ts
 十、部署配置
 P1｜代理头与信任配置互相矛盾：nginx 传了 X-Real-IP/X-Forwarded-For，后端却 SetTrustedProxies(nil)；两者必须一起改，否则限流、日志、审计全部失真。

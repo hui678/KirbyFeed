@@ -106,6 +106,12 @@ func main() {
 		return err
 	})
 	defer db.CloseDB(sqlDB)
+	// 这两张表是本次新增的 Worker 侧依赖（死信台账、点赞事件台账），
+	// 单独迁移一次，避免「API 还没重启、Worker 先上线」时死信消费者直接报错。
+	// 其余业务表的建表仍由 API 进程的 AutoMigrate 负责。
+	if err := db.AutoMigrateWorker(sqlDB); err != nil {
+		log.Fatalf("Failed to auto migrate worker tables: %v", err)
+	}
 
 	// 连接 Redis（用于流行度更新）
 	cache, err := rediscache.NewFromEnv(&cfg.Redis)
@@ -158,6 +164,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 队列积压 gauge：消费速率掉下去时，先看到的是 queue_depth 抬头。
+	go observability.SampleQueueDepth(ctx, conn, []string{
+		mqrabbit.LikeTopic.Queue,
+		mqrabbit.CommentTopic.Queue,
+		mqrabbit.SocialTopic.Queue,
+		mqrabbit.PopularityTopic.Queue,
+		mqrabbit.RetryQueueName(mqrabbit.LikeTopic.Queue),
+		mqrabbit.RetryQueueName(mqrabbit.CommentTopic.Queue),
+		mqrabbit.RetryQueueName(mqrabbit.SocialTopic.Queue),
+		mqrabbit.RetryQueueName(mqrabbit.PopularityTopic.Queue),
+	}, 15*time.Second)
+
+	// like_events 只是去重账本，按保留期清理，避免无限增长。
+	go purgeLikeEvents(ctx, likeRepo)
+
 	pprofServer, err := observability.NewPprofServer(
 		"Worker",
 		cfg.ObservabilityConfig.Pprof.Enabled,
@@ -208,7 +229,7 @@ func main() {
 			continue
 		}
 		go runWorkerWithRetry(ctx, "DLQWorker-"+t.Name, conn, func(ch *amqp.Channel) error {
-			return worker.NewDLQWorker(t.Queue).Run(ctx, ch)
+			return worker.NewDLQWorker(sqlDB, t.Queue).Run(ctx, ch)
 		})
 	}
 
@@ -219,4 +240,27 @@ func main() {
 	// 没跑完的消息会在 ctx 取消时被 Nack(requeue=true) 退回队列，不会丢。
 	time.Sleep(10 * time.Second)
 	log.Printf("Worker stopped")
+}
+
+// purgeLikeEvents 周期性删除过期的 like 去重记录。
+// 保留期远大于消息最长存活时间（重试队列几轮 TTL + 死信滞留），
+// 因此不会出现「账本已删、旧消息又被重投」导致重复计数。
+func purgeLikeEvents(ctx context.Context, repo *video.LikeRepository) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := repo.PurgeLikeEvents(ctx, time.Now().Add(-video.LikeEventRetention))
+			if err != nil {
+				log.Printf("like_events 清理失败: %v", err)
+				continue
+			}
+			if n > 0 {
+				log.Printf("like_events 清理 %d 条过期记录", n)
+			}
+		}
+	}
 }

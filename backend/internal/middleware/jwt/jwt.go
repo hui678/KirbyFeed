@@ -15,6 +15,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// AccountTokenStore 收窄判活对账号存储的依赖：判活只需要「按 ID 读一行」。
+// 用接口而不是具体 Repository，才能在不接 MySQL 的情况下覆盖吊销路径。
+type AccountTokenStore interface {
+	FindByID(ctx context.Context, id uint) (*account.Account, error)
+}
+
 // bearerToken 解析 Authorization 头。
 // 返回值：(token 字符串, 头部是否格式正确)。空串 + true 表示「压根没带」。
 func bearerToken(c *gin.Context) (string, bool) {
@@ -34,7 +40,7 @@ func bearerToken(c *gin.Context) (string, bool) {
 }
 
 // JWTAuth 硬鉴权：没有有效 token 直接 401，用于写接口和必须登录才能看的接口。
-func JWTAuth(accountRepo *account.AccountRepository, cache *rediscache.Client) gin.HandlerFunc {
+func JWTAuth(accountRepo AccountTokenStore, cache *rediscache.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenString, ok := bearerToken(c)
 		if !ok {
@@ -67,7 +73,7 @@ func JWTAuth(accountRepo *account.AccountRepository, cache *rediscache.Client) g
 // 修复要点：旧实现在 token 解析失败（过期或签名非法）时直接 401，
 // 结果用户揣着一张过期 token 刷公开 Feed 会整页报错 —— 这跟「匿名可浏览」的设计目标相悖。
 // 现在的语义是：任何一步拿不到可信身份，就退化成匿名继续，绝不阻断公开内容。
-func SoftJWTAuth(accountRepo *account.AccountRepository, cache *rediscache.Client) gin.HandlerFunc {
+func SoftJWTAuth(accountRepo AccountTokenStore, cache *rediscache.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenString, ok := bearerToken(c)
 		if !ok || tokenString == "" {
@@ -93,7 +99,7 @@ func SoftJWTAuth(accountRepo *account.AccountRepository, cache *rediscache.Clien
 }
 
 // VerifyToken 供非 HTTP 中间件场景（如 SSE 握手）复用同一套校验规则。
-func VerifyToken(ctx context.Context, tokenString string, accountRepo *account.AccountRepository, cache *rediscache.Client) (*auth.Claims, bool) {
+func VerifyToken(ctx context.Context, tokenString string, accountRepo AccountTokenStore, cache *rediscache.Client) (*auth.Claims, bool) {
 	claims, err := auth.ParseToken(tokenString)
 	if err != nil {
 		return nil, false
@@ -113,7 +119,7 @@ func VerifyToken(ctx context.Context, tokenString string, accountRepo *account.A
 // 注意「Redis 里的值 != 传入 token」时也回源 DB，而不是直接判死：
 // DB 才是权威，Redis 只是快路径；若登录时 Redis 写入失败而 DB 写入成功，
 // 直接判死会让刚登录的用户拿着合法 token 被 401。登出时两侧都删，吊销依然即时。
-func isActive(ctx context.Context, claims *auth.Claims, tokenString string, accountRepo *account.AccountRepository, cache *rediscache.Client) bool {
+func isActive(ctx context.Context, claims *auth.Claims, tokenString string, accountRepo AccountTokenStore, cache *rediscache.Client) bool {
 	if claims == nil || claims.AccountID == 0 {
 		return false
 	}

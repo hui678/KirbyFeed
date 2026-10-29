@@ -3,31 +3,34 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
+	"feedsystem_video_go/internal/observability"
 	"feedsystem_video_go/internal/video"
 
 	amqp "github.com/rabbitmq/amqp091-go"
-	oredis "github.com/redis/go-redis/v9"
 )
 
 const (
-	outboxPollInterval  = time.Second // 正常轮询间隔：这就是"秒级投递延迟"的来源
-	outboxPollBatch     = 100
-	outboxReapInterval  = 30 * time.Second // 回收崩溃残留的 processing 消息
-	outboxPurgeInterval = 10 * time.Minute // 清理已发送的历史消息
-	outboxRetryWait     = 5 * time.Second  // MQ/Channel 未就绪时的重连等待
+	outboxPollInterval   = time.Second // 正常轮询间隔：这就是"秒级投递延迟"的来源
+	outboxPollBatch      = 100
+	outboxReapInterval   = 30 * time.Second // 回收崩溃残留的 processing 消息
+	outboxPurgeInterval  = 10 * time.Minute // 清理已发送的历史消息
+	outboxRetryWait      = 5 * time.Second  // MQ/Channel 未就绪时的重连等待
+	outboxStatsInterval  = time.Minute      // 周期打印状态，供日志采集做告警
+	outboxPendingWarnAge = 5 * time.Minute  // 最老 pending 超过这个时长就告警
 )
 
 // StartOutboxPoller 后台轮询本地消息表，把"已随业务事务提交、但还没投递"的
 // 视频发布事件发到 RabbitMQ，消费端再写入 Redis 热时间线。
 //
 // 四处关键可靠性设计：
-//  1. publisher confirm：只有 broker 确认落盘，消息才会被置为 sent（TimelineMQ.waitConfirm）；
+//  1. publisher confirm：只有 broker 返回 ack，消息才会被置为 sent（PublishWithDeferredConfirm + DeliveryTag）；
 //  2. CAS 抢占 + fencing token：多实例下靠 UPDATE ... WHERE status='pending' 的 RowsAffected
 //     决定归属；令牌保证「卡住的旧持有者」不会把「新持有者」的消息标成已发送；
 //  3. 稳定的 event_id：幂等键在写入 outbox 时就固定，重投不换 ID，消费端才可能去重；
@@ -46,6 +49,7 @@ func StartOutboxPoller(ctx context.Context, repo *video.OutboxRepository, rmq *r
 		// 马上接管过来。如果初始化成 time.Now()，重启后要白等 30 秒才开始接管。
 		var lastReap time.Time
 		var lastPurge time.Time
+		var lastStats time.Time
 
 		for {
 			select {
@@ -88,6 +92,18 @@ func StartOutboxPoller(ctx context.Context, repo *video.OutboxRepository, rmq *r
 					log.Printf("Outbox poller: 清理 %d 条已发送的历史消息", n)
 				}
 				lastPurge = now
+			}
+
+			// 周期性输出状态：failed/stuck/最老 pending 超阈值时打 [ALERT]，
+			// 让「消息卡住了」在没有管理台的情况下也能被日志采集发现。
+			if now.Sub(lastStats) >= outboxStatsInterval {
+				stats, err := repo.Stats(ctx, now.Add(-video.OutboxClaimTimeout))
+				if err != nil {
+					log.Printf("Outbox poller: 状态统计失败: %v", err)
+				} else {
+					logOutboxStats(now, stats)
+				}
+				lastStats = now
 			}
 
 			msgs, err := repo.ListDue(ctx, outboxPollBatch, now)
@@ -139,8 +155,28 @@ func StartOutboxPoller(ctx context.Context, repo *video.OutboxRepository, rmq *r
 				log.Printf("Outbox poller: 投递失败: id=%d video=%d retry=%d err=%v",
 					msg.ID, msg.VideoID, msg.RetryCount, pubErr)
 
+				// broker/连接级故障：消息本身没问题，不消耗重试额度。
+				// MQ 长时间不可用期间消息会一直 pending，恢复后自动补发；
+				// 永久性拓扑损坏由「最老 pending 时长」告警发现，而不是靠烧重试次数。
+				if errors.Is(pubErr, rabbitmq.ErrBrokerUnavailable) {
+					ok, err := repo.MarkDeferred(ctx, msg.ID, token,
+						time.Now(), video.OutboxBrokerRetryDelay, errText(pubErr))
+					if err != nil {
+						log.Printf("Outbox poller: 安排重投失败: id=%d, err=%v", msg.ID, err)
+					} else if !ok {
+						log.Printf("Outbox poller: id=%d 已被其他实例接管, 本次重投安排丢弃", msg.ID)
+					}
+
+					// 连接级故障大概率意味着整条 channel 都不可用：
+					// 重建一次，避免整批消息反复撞同一条坏连接。
+					_ = tmq.Close()
+					tmq = nil
+					break
+				}
+
+				// 消息级失败：消耗重试额度，耗尽后转 failed 等人工处理。
 				if msg.RetryCount+1 > video.OutboxMaxRetries {
-					ok, err := repo.MarkFailed(ctx, msg.ID, token)
+					ok, err := repo.MarkFailed(ctx, msg.ID, token, errText(pubErr))
 					if err != nil {
 						log.Printf("Outbox poller: 标记 failed 失败: id=%d, err=%v", msg.ID, err)
 					} else if ok {
@@ -149,17 +185,12 @@ func StartOutboxPoller(ctx context.Context, repo *video.OutboxRepository, rmq *r
 					}
 					continue
 				}
-				if ok, err := repo.MarkRetry(ctx, msg.ID, token, msg.RetryCount+1, time.Now()); err != nil {
+				if ok, err := repo.MarkRetry(ctx, msg.ID, token, msg.RetryCount+1, time.Now(), errText(pubErr)); err != nil {
 					log.Printf("Outbox poller: 安排重试失败: id=%d, err=%v", msg.ID, err)
 				} else if !ok {
 					log.Printf("Outbox poller: id=%d 已被其他实例接管, 本次重试安排丢弃", msg.ID)
 				}
-
-				// 投递异常大概率是 channel 坏了：重建一次，避免整批消息反复撞同一条坏连接。
-				// 已经 MarkRetry 的消息会按退避时间重新可见，不会丢。
-				_ = tmq.Close()
-				tmq = nil
-				break
+				// NACK 是消息级问题，不代表 channel 坏了：继续处理本批，不重建连接。
 			}
 
 			sleepOrDone(ctx, outboxPollInterval)
@@ -220,6 +251,9 @@ func StartConsumer(ctx context.Context, rmq *rabbitmq.RabbitMQ, queueName string
 				Name:  "TimelineConsumer",
 				Queue: queueName,
 				Retry: retry,
+				// 时间线在 QoS=10 的单条流里消费：进程内 sleep 重试会阻塞整条流。
+				// 只留 1 次本地重试抹平瞬时抖动，其余尽早交给 TTL 重试队列。
+				MaxLocalRetries: 1,
 				Process: func(ctx context.Context, d amqp.Delivery) error {
 					return processTimeline(ctx, redisClient, d)
 				},
@@ -277,19 +311,76 @@ func zaddTimeline(ctx context.Context, redisClient *rediscache.Client, event *ra
 	opCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 
-	timelineKey := redisClient.Key("feed:global_timeline")
-	if err := redisClient.ZAdd(opCtx, timelineKey, oredis.Z{
-		Score:  float64(event.CreateTime),
-		Member: fmt.Sprintf("%d", event.VideoID),
-	}); err != nil {
-		return err
+	// 写入与裁剪必须原子：分成两条命令时，中间会露出 1001 条的窗口；
+	// 更糟的是裁剪失败原先只打日志，集合会一直超量到下一次成功写入。
+	// Lua 在 Redis 内单线程执行，不存在「写进去了但没裁」的中间态。
+	_, err := redisClient.Eval(opCtx, timelineZAddAndTrim, []string{video.TimelineZSetKey(redisClient)},
+		float64(event.CreateTime),
+		fmt.Sprintf("%d", event.VideoID),
+		video.TimelineCapacity,
+	)
+	return err
+}
+
+// timelineZAddAndTrim 写入一条时间线事件并按排名裁剪，返回裁剪后的基数。
+// ARGV: [score, member, capacity]
+const timelineZAddAndTrim = `
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -(tonumber(ARGV[3]) + 1))
+return redis.call('ZCARD', KEYS[1])
+`
+
+// logOutboxStats 周期输出 Outbox 状态，异常时打 [ALERT] 前缀，
+// 方便日志采集按关键字告警（这是没有管理台时的最小观测手段）。
+// 同一份数据也写成 gauge，便于在 /metrics 上画「pending 是否持续上涨」。
+func logOutboxStats(now time.Time, s video.OutboxStats) {
+	observability.SetGauge("feedsystem_outbox_messages", s.Pending, "status", "pending")
+	observability.SetGauge("feedsystem_outbox_messages", s.Processing, "status", "processing")
+	observability.SetGauge("feedsystem_outbox_messages", s.Failed, "status", "failed")
+	observability.SetGauge("feedsystem_outbox_messages", s.Stuck, "status", "stuck")
+	if s.OldestPendingAt != nil {
+		observability.SetGauge("feedsystem_outbox_oldest_pending_seconds",
+			int64(now.Sub(*s.OldestPendingAt).Seconds()))
+	} else {
+		observability.SetGauge("feedsystem_outbox_oldest_pending_seconds", 0)
 	}
 
-	// 滚动淘汰：只保留 score 最高的 1000 条，多余的最老数据被裁掉
-	if err := redisClient.ZRemRangeByRank(opCtx, timelineKey, 0, -1001); err != nil {
-		log.Printf("Timeline consumer: ZRem 失败: %v", err)
+	if s.Pending == 0 && s.Processing == 0 && s.Failed == 0 && s.Stuck == 0 {
+		return
 	}
-	return nil
+	oldest := "-"
+	if s.OldestPendingAt != nil {
+		oldest = now.Sub(*s.OldestPendingAt).Round(time.Second).String()
+	}
+	log.Printf("Outbox stats: pending=%d processing=%d failed=%d stuck=%d max_retry=%d oldest_pending=%s",
+		s.Pending, s.Processing, s.Failed, s.Stuck, s.MaxRetryCount, oldest)
+
+	if s.Failed > 0 {
+		log.Printf("[ALERT] Outbox 有 %d 条 failed，需要人工排查并重放（POST /admin/outbox/replay）", s.Failed)
+	}
+	if s.Stuck > 0 {
+		log.Printf("[ALERT] Outbox 有 %d 条 processing 超过 %s 未落地，检查是否有实例崩溃",
+			s.Stuck, video.OutboxClaimTimeout)
+	}
+	if s.OldestPendingAt != nil {
+		if age := now.Sub(*s.OldestPendingAt); age > outboxPendingWarnAge {
+			log.Printf("[ALERT] Outbox 最老 pending 已等待 %s（阈值 %s），投递链路可能中断",
+				age.Round(time.Second), outboxPendingWarnAge)
+		}
+	}
+}
+
+// errText 截断错误信息，避免超出 last_error 列的长度（按 rune 截断，不切坏 UTF-8）。
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	r := []rune(err.Error())
+	const maxLen = 500
+	if len(r) > maxLen {
+		r = r[:maxLen]
+	}
+	return string(r)
 }
 
 // sleepOrDone 可中断的 sleep，保证进程退出时 goroutine 不会卡在等待里

@@ -4,13 +4,15 @@
 > 代码基线：**2026-10-27** 的 `backend/internal/feed/service.go`、`backend/internal/video/*`
 > 配套文档：`面试/Feed三级缓存与缓存自愈-面试专题.md`（完整专题）、`start-learn/缓存体系.md`（源码笔记）、`learn/feed模块学习文档.md`（模块总览）
 > 用法：先看 §0 的 7 条事实 → 按题号背 → 用 §4 一页速答复盘 → §6 检查旧文档里哪些话已经过时
+>
+> **2026-10-27 修订**：文中标注「已修」的条目已落到代码：统一回源闸门（`dbguard`）、实体回写版本 CAS、关注流列表只存 ID、hydrate 失败不再静默短页、Redis `ContextTimeoutEnabled`、改名同步 `videos.username`、有界异步回写。下面的事实与代码一致，旧的「本项目没做」表述已逐条更新。
 
 ---
 
 ## 0. 先钉死 7 条事实（否则后面每道题都会答偏）
 
 **事实 1：三级缓存只覆盖「按 ID 装配视频实体」这一条路径。**
-`GetVideoByIDs` 只有两个调用方：`ListLatest`（最新流）和 `ListByPopularity`（热榜）。关注流 `ListByFollowing` 走的是另一条链路：整页结果缓存 + SETNX，不进三级实体缓存。
+`GetVideoByIDs` 有三个调用方：`ListLatest`、`ListByPopularity`、`ListByFollowing` 的 hydrate。关注流的**列表缓存只存 `VideoIDs + 游标 + HasMore`**，内容每次都用同一套三级实体缓存装配，不再冻结整页渲染结果。
 
 **事实 2：实体缓存 `video:entity:<id>` 由三条读路径共享。**
 Feed 最新流、热榜、详情页 `GetDetail` 共用同一个 key、同一个 TTL、同一个 singleflight Group。这是 10 月那轮重构的结果（旧文档里的 `video:detail` 和详情页 SETNX 已经不存在）。
@@ -18,26 +20,29 @@ Feed 最新流、热榜、详情页 `GetDetail` 共用同一个 key、同一个 
 **事实 3：L1 实际 TTL 是 5 秒，不是 3 秒。**
 `cache.New(3*time.Second, 5*time.Second)` 的两个参数是「默认 TTL」和「janitor 扫描间隔」；两处写入都显式传了 5 秒，显式值优先。
 
-**事实 4：穿透和雪崩的防护是后来补的。**
-- 穿透：`video:entity:<id>` 写 `__null__` 哨兵，TTL 60s，两条读路径都识别。
-- 雪崩：连接池上限 64 + 应用层回源闸门 32（每进程），非阻塞。
-旧文档说「没有空值缓存」「没有熔断/限流兜底」的地方，需要按当前代码更新。
+**事实 4：穿透、雪崩和「旧值回填」都已有实现。**
+- 穿透：`video:entity:<id>` 写 `__null__` 哨兵，TTL 60s，Feed 和 `GetDetail` 都识别。
+- 雪崩：MySQL 连接池 64 + 统一回源闸门 `dbguard`（容量 = `MaxOpenConns/2` = 32/进程，非阻塞）。
+- 旧值回填：每次失效 `INCR version + DEL entity`（Lua 原子），回写用版本 CAS；版本读不到就不回写。
+- 异步回写：有界（256 个在途槽位，满了丢弃），避免 Redis 故障时 goroutine 无上限堆积。
 
-**事实 5：50ms 只是「代码意图」，不等于真实 IO 上限。**
-所有 Redis 操作都套了 `context.WithTimeout(ctx, 50ms)`，但当前 `redis.NewClient` 没有开启 `ContextTimeoutEnabled`，go-redis v9 默认不把 ctx deadline 传给 socket 读写。真实单次读受 `ReadTimeout`（默认 3s）约束。这条在 Q12 展开，是很容易被追问打穿的点。
+**事实 5：50ms 现在是真的 50ms 上限。**
+`redis.NewFromEnv` 已开 `ContextTimeoutEnabled: true`，所有 `WithTimeout(50ms)` 会真正约束 socket I/O；同时把 `ReadTimeout/WriteTimeout` 压到 1s 作为无 deadline 调用的兜底。旧代码默认 3s 读超时的问题已修。
 
 **事实 6：本项目没有主动「预热」，自愈是请求驱动的。**
 Redis 恢复后，谁先访问谁回源并异步回填；没有定时任务，也没有预热脚本。
 
-**事实 7：关注流整页缓存存的是完整渲染结果。**
-包括 `LikesCount`、`IsLiked`、作者用户名。视频内容变更、点赞数变化都不会失效这份缓存，最长脏 24 小时。这是本项目最值得主动披露的一致性缺口。
+**事实 7：关注流不再缓存整页渲染结果，但仍不是强一致。**
+列表缓存只有 ID 和游标：改名、点赞数、`IsLiked`、删视频都会在 hydrate 时重新计算，不再脏 24 小时。剩下的窗口是：
+- 首页 TTL 30s（新视频/取关变化），深层页 24h（游标单向翻页，新内容不影响已翻过的页）；
+- L1 仍是每实例一份，写路径只删 Redis，跨实例最多脏 5s（Q15）。
 
 ---
 
 ## 0.1 一张链路图
 
 ```text
-GetVideoByIDs(videoIDs)                      ← 最新流 / 热榜 hydrate
+GetVideoByIDs(videoIDs)                      ← 最新流 / 热榜 / 关注流 hydrate
   │
   ├─ L1  go-cache（进程内存，实际 5s）
   │     命中 → 直接进 videoMap
@@ -49,20 +54,35 @@ GetVideoByIDs(videoIDs)                      ← 最新流 / 热榜 hydrate
   │     未命中/类型错/JSON 坏 → missedL2
   │     MGet 报错/超时 → missedL2 = missedL1（全量降级）
   │
+  ├─ 版本 MGET：取 missedL2 各自的 video:entity:ver:<id>
+  │     读失败 → 本次不回写（比较基准不可信）
+  │
   └─ L3  MySQL：每个 miss 的 ID 一个 goroutine
         └─ singleflight.Do("sf:entity:<id>")
-             ├─ 抢回源闸门（32/进程，非阻塞）
+             ├─ 抢回源闸门 dbguard（32/进程，非阻塞）
              ├─ leader：查库
-             │    ├─ 查到 → 异步回写 Redis(1h)
-             │    └─ 查不到 → 异步写 __null__ 哨兵(60s)
+             │    ├─ 查到 → 有界异步回写：版本 CAS 成功才 SET(1h)
+             │    └─ 查不到 → 有界异步写 __null__ 哨兵(60s)
              └─ follower：阻塞等待，共享 leader 的返回值
         → 每个请求各自写 L1(5s) → videoMap
   │
   ▼
 buildOrderedResult(videoIDs, videoMap)       ← 按原顺序重排
+        │
+        └─ 有 ID 回源失败 → 返回聚合错误（handler 映射 500/503），
+           不再返回「短页 + nil error」
 ```
 
-对应代码：`backend/internal/feed/service.go:121-250`、`backend/internal/video/video_cache.go:19-88`。
+关注流的列表层是另一份缓存，但只到 ID 为止：
+
+```text
+ListByFollowing(limit, cursor, accountID)
+  ├─ Redis GET feed:listByFollowing:v2:...  → CachedFollowingPage{VideoIDs, NextTime, NextIDBefore, HasMore}
+  │     命中 → GetVideoByIDs(IDs) → 重新装配 LikesCount / IsLiked / 已删 / 改名
+  └─ miss → SETNX 锁 → dbguard → JOIN 查询 → 只缓存 ID 页（首页 30s / 深层 24h）
+```
+
+对应代码：`backend/internal/feed/service.go:123-263`、`backend/internal/video/video_cache.go`、`backend/internal/videocache/entity.go`。
 
 ---
 
@@ -70,22 +90,27 @@ buildOrderedResult(videoIDs, videoMap)       ← 按原顺序重排
 
 | 参数 | 值 | 位置 | 作用 / 为什么 |
 |---|---|---|---|
-| L1 默认 TTL | 3s | `feed/service.go:94` | 未生效，模块里没有调用 `SetDefault` |
-| L1 janitor 扫描间隔 | 5s | `feed/service.go:94` | 后台清理过期条目的频率，不是 TTL |
-| L1 实际 TTL | **5s** | `feed/service.go:175,244` | 显式传入，优先于默认值 |
-| 实体缓存 TTL | **1h** | `video/video_cache.go:22` | 兜底上界；一致性主要靠写路径 `DEL` |
-| 空值哨兵 TTL | **60s** | `video/video_cache.go:43` | 防穿透；数据补上后最多延迟 60s 可读 |
-| 关注流整页 TTL | **24h** | `feed/service.go:95,583` | 查询昂贵；只有关注/取关会主动失效 |
-| 单次 Redis 操作 ctx | **50ms** | `feed/service.go:28`、`video/video_cache.go:17` | 意图是快速失败；真实 IO 上限见 Q12 |
-| 关注流锁 TTL | **500ms** | `feed/service.go:599` | 防止持锁进程挂掉后死锁 |
-| 等锁轮询 | **5 × 20ms** | `feed/service.go:619-628` | 等不到就兜底查库，不让请求无限阻塞 |
-| MySQL 连接池 | **最大 64 / 空闲 16 / 连接寿命 1h** | `config/loadconfig.go:34-39`、`db/db.go:36-38` | 驱动层硬闸门 |
-| 回源闸门 | **32 / 进程** | `config/loadconfig.go:38`、`feed/service.go:68,96` | 应用层准入闸，非阻塞 |
+| L1 默认 TTL | 3s | `feed/service.go:118` | 未生效，模块里没有调用 `SetDefault` |
+| L1 janitor 扫描间隔 | 5s | `feed/service.go:118` | 后台清理过期条目的频率，不是 TTL |
+| L1 实际 TTL | **5s** | `feed/service.go:178,289` | 显式传入，优先于默认值 |
+| 实体缓存 TTL | **1h** | `videocache/entity.go:19` | 兜底上界；一致性主要靠写路径 `DEL` |
+| 空值哨兵 TTL | **60s** | `videocache/entity.go:28` | 防穿透；数据补上后最多延迟 60s 可读 |
+| 版本号 TTL | **25h** | `videocache/entity.go:33` | 必须长于实体 TTL，否则迟到的旧值又能通过 CAS |
+| 关注流首页 TTL | **30s** | `feed/service.go:43` | 首页会被新视频影响，取关也会整体失效 |
+| 关注流深层页 TTL | **24h** | `feed/service.go:653` | 游标单向翻页，新内容不会改变已翻过的页 |
+| 单次 Redis 操作 ctx | **50ms** | `feed/service.go:28`、`video/video_cache.go:19` | 已开启 `ContextTimeoutEnabled`，真实生效 |
+| Redis 读/写超时 | **1s** | `middleware/redis/redis.go` | 无 deadline 调用的兜底上限 |
+| 关注流锁 TTL | **500ms** | `feed/service.go:710` | 防止持锁进程挂掉后死锁 |
+| 等锁轮询 | **5 × 20ms** | `feed/service.go:730-739` | 等不到就兜底查库，不让请求无限阻塞 |
+| MySQL 连接池 | **最大 64 / 空闲 16 / 连接寿命 1h** | `config/loadconfig.go:36-41`、`db/db.go:36-38` | 驱动层硬闸门 |
+| 回源闸门 | **`MaxOpenConns/2` = 32 / 进程** | `dbguard/dbguard.go`、`db/db.go:43` | 随连接池自动伸缩，避免两边脱节 |
+| Redis 连接池 | **64 / 空闲 8 / 池等待 200ms / 重试 1** | `middleware/redis/redis.go` | 池满快速失败，故障时不重试放大 |
+| 异步回写并发 | **256 个槽位** | `video/video_cache.go:100` | 满了丢弃，下一轮 miss 会再补 |
 | 热榜窗口 | **60 分钟桶** | `feed/service.go:33` | 滑动窗口长度 |
 | 热榜桶 TTL | **2h** | `video/popularity_cache.go:15` | 必须大于 60 分钟合并窗口 |
-| 热榜快照 TTL | **2min** | `feed/service.go:38` | 1 分钟封桶 + 1 分钟余量 |
-| 热榜快照上限 | **5000** | `feed/service.go:45` | 把合并排序的 M 压成常数 |
-| 热榜合并超时 | **500ms** | `feed/service.go:51` | ZUNIONSTORE 单独预算 |
+| 热榜快照 TTL | **2min** | `feed/service.go:54` | 1 分钟封桶 + 1 分钟余量 |
+| 热榜快照上限 | **5000** | `feed/service.go:71` | 把合并排序的 M 压成常数 |
+| 热榜合并超时 | **500ms** | `feed/service.go:77` | ZUNIONSTORE 单独预算 |
 
 ---
 
@@ -116,28 +141,30 @@ buildOrderedResult(videoIDs, videoMap)       ← 按原顺序重排
 读放大高 + 能容忍秒级脏 + 数据基数可控 → 加 L1 值得；写多读少、强一致、字段频繁变更 → 只用 Redis 更简单。
 
 **代码依据**
-- 三级链路：`backend/internal/feed/service.go:121-250`
-- L1 构造：`backend/internal/feed/service.go:94`
-- 实体 key / TTL 收敛：`backend/internal/video/video_cache.go:19-27`
+- 三级链路：`backend/internal/feed/service.go:123-263`
+- L1 构造：`backend/internal/feed/service.go:118`
+- 实体 key / TTL 收敛：`backend/internal/video/video_cache.go:24-34`
 
 **可能追问：L1 为什么不做跨实例广播失效？**
 因为成本与收益不匹配：Feed 对 5 秒旧数据不敏感；引入 Pub/Sub 后仍有消息丢失、Pod 重启漏消息的问题，最后还是需要 TTL 兜底。用 5 秒 TTL 换掉一套广播基础设施，是这个量级下的合理取舍。详见 Q15。
 
 ---
 
-## Q2. 本地缓存 TTL 为什么是秒级？Redis 实体缓存为什么 1 小时、列表缓存 24 小时？这些时间如何确定？
+## Q2. 本地缓存 TTL 为什么是秒级？Redis 实体缓存为什么 1 小时、关注流列表为什么要分 30 秒和 24 小时？这些时间如何确定？
 
 **一句话结论**
-L1 的 TTL 是「跨实例脏数据窗口的上界」；L2 实体 TTL 是「写失效失败时的兜底上界」；L2 列表 TTL 是「查询昂贵 + 失效不完整时的损失上界」。三者含义不同，不能用一个公式套。
+L1 的 TTL 是「跨实例脏数据窗口的上界」；L2 实体 TTL 是「写失效失败时的兜底上界」；列表 TTL 分两层：首页 30s 兜「新视频/取关」，深层页 24h 兜「昂贵的 JOIN 查询」。三者含义不同，不能用一个公式套。
 
 **逐个拆**
 
 | 层 | TTL | 它到底是什么 | 为什么是这个量级 |
 |---|---|---|---|
 | L1 | **5s** | 多实例不一致的最坏窗口 | 没有跨实例失效广播，TTL 直接等于「实例 A 看不到实例 B 的写」的最长时间。设长 → 用户看到旧点赞数 / 已删视频；设短 → 失去本地缓存意义。Feed 能忍几秒旧数据，5s 是折中 |
-| L2 实体 | **1h** | 写路径 `DEL` 失败时的兜底上界 | 一致性主要靠事件驱动失效（点赞、删除都会 `DEL`），TTL 只是「万一 DEL 失败，别永久脏」。而且实体是**读时按需写入**，每个 key 的过期时刻由首次访问决定，天然打散，不会整点一起失效 |
-| L2 列表 | **24h** | 失效不完整时的损失上界 | 关注流是 JOIN 关注表 + 排序的昂贵查询，缓存收益大；但只有关注/取关会主动失效，视频改标题、删视频、点赞数变化都不会失效。24h 意味着这些字段最长脏一天 —— 这是**已知的、有意接受**的代价 |
+| L2 实体 | **1h** | 写路径 `DEL` 失败时的兜底上界 | 一致性主要靠事件驱动失效（点赞、删除都会 `DEL` + 版本 +1），TTL 只是「万一 DEL 失败，别永久脏」。而且实体是**读时按需写入**，每个 key 的过期时刻由首次访问决定，天然打散，不会整点一起失效 |
+| L2 关注流首页 | **30s** | 新视频 / 取关变化的可见延迟上界 | 首页会被新内容影响，不能缓存太久；页内字段本来就每次 hydrate，所以 30s 只影响「哪些 ID 出现在第一页」 |
+| L2 关注流深层页 | **24h** | 昂贵 JOIN 的复用窗口 | 游标单向翻页，已翻过的页不会被新视频影响；取关会按 pattern 失效。24h 是「查询贵 + 成员变化少」的折中 |
 | 空值哨兵 | **60s** | 「确定不存在」这个判断的有效期 | 数据后来补上时，最多延迟 60s 就能读到；太长会把新视频误判为不存在 |
+| 版本号 | **25h** | CAS 比较基准的存活期 | 必须明显长于实体 1h；版本先过期会让迟到的旧值重新通过校验 |
 | 热榜快照 | **2min** | 一次分页会话的冻结窗口 | 必须 > 1 分钟：只有等 `asOf` 所在分钟桶封桶后再重建，结果才和首份快照逐位一致；2min = 1min 封桶 + 1min 余量 |
 | 热榜分钟桶 | **2h** | 计数器存活期 | 必须 > 60 分钟的合并窗口，否则最老的桶在合并前就过期，热度会算少 |
 
@@ -152,13 +179,13 @@ L1 的 TTL 是「跨实例脏数据窗口的上界」；L2 实体 TTL 是「写�
 
 - **为什么实体 1h 而不是 5min？**
   因为实体是热点共享数据，1h 能显著减少回源；一致性靠 `DEL` 保证，不靠 TTL。1h 只是「DEL 失败时别脏太久」的上界。
-- **为什么列表 24h 这么久？**
-  关注流查询昂贵，且结果因人而异，无法跨用户共享；用 24h 换掉大量 JOIN。代价是内容变更最长脏 24h。如果产品对「删视频必须立刻消失」有硬要求，这个 TTL 就不能接受，必须改成失效或改结构。
+- **关注流为什么首页 30s、深层页 24h？**
+  游标翻页是单向的：新视频只会改变第一页，深层页的内容集合基本不变，所以深层页可以缓存久。首页 30s 是为了让新发布和取关及时反映；即使成员旧了，页内内容仍会 hydrate，不会把点赞数/标题冻住。
 - **为什么不做 TTL 随机抖动？**
   实体的过期时刻本来就被「首次访问时间」打散了；列表 key 带 `accountID + 游标`，也天然分散；快照 key 带分钟级 `asOf`。真正需要抖动的「大批 key 同时过期」在本项目不突出。**更重要的是：抖动对「Redis 整体不可用」这种雪崩完全无效**，详见 Q13。
 
 **代码依据**
-`feed/service.go:94-95`、`feed/service.go:175,244`、`video/video_cache.go:22,43`、`video/popularity_cache.go:15-18`、`feed/service.go:35-51`。
+`feed/service.go:43,118`、`videocache/entity.go`、`video/popularity_cache.go:15-18`、`feed/service.go:48-77`。
 
 ---
 
@@ -172,16 +199,16 @@ L1 的 TTL 是「跨实例脏数据窗口的上界」；L2 实体 TTL 是「写�
 | | 缓存击穿 | 缓存穿透 | 缓存雪崩 |
 |---|---|---|---|
 | 触发条件 | **单个热点 key** 过期 / 被删 | 查询的 key **在数据源里也不存在** | 大量 key 同时过期，**或 Redis 整体不可用** |
-| 本项目手段 | 实体：singleflight；关注流：SETNX；L1 也算一层 | `__null__` 哨兵，TTL 60s | 连接池上限 + `dbLoadGate`；TTL 天然分散 |
-| 代码 | `feed/service.go:203`、`feed/service.go:599` | `video/video_cache.go:38`、`feed/service.go:167`、`video/video_service.go:127` | `db/db.go:36-38`、`feed/service.go:206`、`config/loadconfig.go:34-39` |
-| 残余风险 | singleflight 只到 **P（Pod 数）**；SETNX 轮询超时后会兜底查库 | 恶意枚举会多出一批短 TTL 占位 key；防攻击要靠网关限流 | 闸门是**每进程**的；熔断、全局限流、指标都没有；部分读路径没接闸门 |
+| 本项目手段 | 实体：singleflight；关注流：SETNX；L1 也算一层 | `__null__` 哨兵，TTL 60s | 连接池上限 + `dbguard`；回写版本 CAS；TTL 天然分散 |
+| 代码 | `feed/service.go` 实体回源、`ListByFollowing` | `videocache/entity.go`、`feed/service.go` `GetVideoByIDs`、`video/video_service.go` `GetDetail` | `db/db.go`、`dbguard/dbguard.go`、`videocache/entity.go` |
+| 残余风险 | singleflight 只到 **P（Pod 数）**；SETNX 轮询超时后会兜底查库 | 恶意枚举会多出一批短 TTL 占位 key；防攻击要靠网关限流 | 闸门是**每进程**的；熔断、全局限流、指标都没有 |
 
 **必须分清的两个「雪崩成因」**
 
 | 成因 | 解法 | 本项目 |
 |---|---|---|
 | (a) 大量 key **同时过期** | TTL 随机抖动 + 多级缓存 + 逻辑过期 | 没有主动抖动；靠「读时按需写入 + key 带分钟/用户维度」天然打散 |
-| (b) 缓存层**整体不可用** | 熔断 + 限流 + 降级 + DB 保护 | 全量降级 + 连接池上限 + 回源闸门；**没有熔断** |
+| (b) 缓存层**整体不可用** | 熔断 + 限流 + 降级 + DB 保护 | 全量降级 + 连接池上限 + 统一回源闸门；**没有熔断** |
 
 > **最容易答错的一句**：「雪崩就用 TTL 随机抖动」。抖动只对成因 (a) 有效；Redis 都挂了，key 过没过期根本不重要。
 
@@ -189,7 +216,7 @@ L1 的 TTL 是「跨实例脏数据窗口的上界」；L2 实体 TTL 是「写�
 
 1. **L1（5s）**：同一实例的瞬时重复读在本地就被吸收，压力到不了 L2。
 2. **singleflight（实体）**：同一进程内，同 key 的并发回源合并成 1 次。N → P（每个 Pod 1 次），不是 N → 1。
-3. **SETNX（关注流整页）**：跨进程互斥，N → 1（理想）；没抢到锁的请求轮询缓存，等不到才兜底查库。
+3. **SETNX（关注流列表页）**：跨进程互斥，N → 1（理想）；没抢到锁的请求轮询缓存，等不到才兜底查库。
 
 **穿透为什么用哨兵而不是布隆过滤器**
 
@@ -210,8 +237,8 @@ L1 的 TTL 是「跨实例脏数据窗口的上界」；L2 实体 TTL 是「写�
 
 **雪崩防护的残余缺口（主动说）**
 
-- `dbLoadGate` 是**每进程 32**，10 个 Pod 就是 320 个并发回源；MySQL 能不能扛住 320 并发，取决于机器，不是代码能保证的。
-- 只有实体 L3 和关注流 DB 查询接了闸门；`ListLatest` 冷区、热榜 MySQL 兜底、`ListLikesCount`、`ListByTag` **都没有接**。
+- `dbguard` 是**每进程**的，容量 = `MaxOpenConns/2`（默认 32）；10 个 Pod 就是 320 个并发回源；MySQL 能不能扛住取决于机器和池配置，不是代码能保证的。
+- 闸门已覆盖全部 Feed DB 入口（实体、冷区、关注流、热榜兜底、话题标签、话题流、`GetDetail`）；`IsLiked` 在闸门满时降级为 `false`。
 - 没有熔断：DB 变慢时不会快速失败，只会把连接池和 goroutine 堆满。
 - 没有全局限流：HTTP 层的限流是 Redis 计数，**Redis 挂了它直接放行**，而且 Feed 读接口根本没挂限流。
 
@@ -263,7 +290,7 @@ singleflight 是「按 key 合并**并发读**」，把 N 个相同请求折叠�
 - **leader 的 ctx 会连累所有人**：本项目闭包里用的是 leader 请求的 `ctx`；leader 的客户端断开 → ctx 取消 → 查库失败 → 999 个 follower 一起拿到错误。严格说，共享回源应该用 `context.WithoutCancel(ctx)` + 独立超时，而不是绑定某一个请求的生命周期。
 
 **代码依据**
-`feed/service.go:203-237`、`video/video_cache.go:69-88`、`feed/service.go:116-122`（safeCopy）。
+`feed/service.go:235-263`、`video/video_cache.go:67-93`、`feed/service.go:256,284`（两处 safeCopy）。
 
 ---
 
@@ -308,7 +335,7 @@ MGET video:entity:1 video:entity:2 video:entity:3
 Pipeline 也是 1 次 RTT，但能拿到逐条结果和逐条错误，不会「一个坏 key 拖垮整批」。代价是客户端要缓存 N 条命令、解析 N 条回复，复杂度比 `MGET` 高。本项目没做，所以选择了「简单 + 故障时全量降级」。
 
 **代码依据**
-`feed/service.go:157-187`；nil / 类型错 / JSON 坏的三种 miss 处理在 `161-181`。
+`feed/service.go:160-191`；nil / 类型错 / JSON 坏的三种 miss 处理在 `164-185`。
 
 ---
 
@@ -340,7 +367,7 @@ Pipeline 也是 1 次 RTT，但能拿到逐条结果和逐条错误，不会「�
   │      leader 返回 → 999 个 follower 拿到同一个 *Video
   │
   ├─ 回写：
-  │      leader：异步 SetBytes(video:entity:123, 1h)  ← 1 次 Redis 写
+  │      leader：有界异步回写，版本 CAS 成功才 SET(video:entity:123, 1h)
   │      每个请求：同步写自己的 L1(5s)                ← 1000 次本地写
   │
   └─ buildOrderedResult：按原顺序返回
@@ -356,7 +383,7 @@ Pipeline 也是 1 次 RTT，但能拿到逐条结果和逐条错误，不会「�
   → missedL2 = missedL1
   → 1000 个 goroutine 全部走到 L3
   → singleflight 仍然把同 key 合并成 1 次
-  → 但这 1 次要先抢 dbLoadGate（32/进程）
+  → 但这 1 次要先抢 dbguard（容量 MaxOpenConns/2）
   → 单个热点 key 只占 1 个配额，所以闸门不会挡住它
   → 最终 MySQL 仍是 1 次（本 Pod）
 ```
@@ -369,7 +396,7 @@ Pipeline 也是 1 次 RTT，但能拿到逐条结果和逐条错误，不会「�
 | 10 个 Pod，每个 100 并发，同一个视频 | **10** |
 | 10 个 Pod，每个 100 并发，一页 20 个热门视频 | 最多 **200**（每 Pod 每个视频 1 次） |
 | leader 查库失败 | 1 次失败 + follower 全部拿到错误；客户端重试后重新选 leader |
-| 闸门已满 | 该条直接丢弃，**0 次**（返回 200，但视频不在结果里） |
+| 闸门已满 | 0 次查询；该请求返回 `ErrServiceOverloaded` → 503（不再返回缺条的 200） |
 
 **这道题真正考的三个点**
 
@@ -378,7 +405,7 @@ Pipeline 也是 1 次 RTT，但能拿到逐条结果和逐条错误，不会「�
 3. 你知道 **leader 的 ctx 会连累 follower**：本项目闭包用的是 leader 请求的 ctx，leader 客户端断开会导致所有 follower 一起失败。
 
 **代码依据**
-`feed/service.go:197-248`；singleflight 在 `203`；闸门在 `206`；L1 写入在 `244`。
+`feed/service.go` 的 `GetVideoByIDs`；singleflight key 为 `sf:entity:<id>`；闸门为 `dbguard.Do`；L1 写入在每个请求的 goroutine 内。
 
 ---
 
@@ -422,7 +449,7 @@ Pipeline 也是 1 次 RTT，但能拿到逐条结果和逐条错误，不会「�
 `singleflight.Group` 内部是一把 `sync.Mutex` 保护整个 map。极高 QPS、大量不同 key 时会有锁竞争，但临界区很短（只是查/插 map），通常不是瓶颈。真到瓶颈再按 key hash 分片成多个 Group，不要提前优化。
 
 **代码依据**
-`video/video_cache.go:69-88`、`feed/service.go:273-297,324-326,371-374,706-715`。
+`video/video_cache.go:67-93`、`feed/service.go:250-263`（异步回写）、`videocache/entity.go:81`（失效）、`feed/service.go:706-715`（关注流加锁）。
 
 ---
 
@@ -443,7 +470,7 @@ Pipeline 也是 1 次 RTT，但能拿到逐条结果和逐条错误，不会「�
 | 进程崩溃 | 当前请求失败 | 重启后 L1 全空 | 不受影响 |
 
 **为什么同一 Pod 还能撑 5 秒？**
-因为第 244 行每个请求都会把结果写进自己的 L1：
+因为第 289 行每个请求都会把结果写进自己的 L1：
 
 ```go
 f.localcache.Set(video.VideoEntityKey(f.rediscache, safeCopy.ID), safeCopy, 5*time.Second)
@@ -457,22 +484,23 @@ f.localcache.Set(video.VideoEntityKey(f.rediscache, safeCopy.ID), safeCopy, 5*ti
 - 它只保证「同一时刻、同一个 key、只有一个 fn 在执行」。
 - 高 QPS 下，leader 完成后新来的请求会开启新一轮；如果缓存一直写不进去，**DB QPS ≈ 请求到达速率**，而不是被 singleflight 压成常数。singleflight 只能压「并发」，不能压「总量」。
 
-**本项目的一个真实缺口**
-异步回写的错误被完全忽略：
+**现在还剩下的缺口：回写失败/丢弃不可观测**
+回写已经改成有界 + 版本 CAS，失败会打日志：
 
 ```go
-go func(k string, b []byte) {
+if !video.ScheduleEntityWrite(func() {
     setCtx, setCancel := context.WithTimeout(context.Background(), singleRedisOpTimeout)
     defer setCancel()
-
-    f.rediscache.SetBytes(setCtx, k, b, video.VideoEntityTTL)
-}(cachekey, b)
+    video.SetVideoEntityIfVersion(setCtx, f.rediscache, id, b, video.VideoEntityTTL, version)
+}) {
+    // 槽位已满：本次回写被丢弃
+}
 ```
 
-`SetBytes` 的返回值没有检查，也没有日志 / 指标。Redis 写失败时，系统「看起来正常」，但缓存永远填不上，DB 会持续承压。改进：至少记日志 + 计数器；更好的做法是失败后带抖动重试一次，或交给一个有界 worker 池。
+`SetVideoEntityIfVersion` 会记录 Redis 错误；但「槽位满导致丢弃」目前没有指标，也没有重试。影响是下一次 miss 要重新查库，不影响正确性。改进方向：加 `cache_write_dropped_total` / `cache_write_failed_total` 计数，并在持续丢弃时告警。
 
 **代码依据**
-`feed/service.go:225-235`（异步回写）、`feed/service.go:239-245`（L1 写入）。
+`feed/service.go` 的 `GetVideoByIDs`（回写与 L1 写入）、`video/video_cache.go` 的 `ScheduleEntityWrite` / `SetVideoEntityIfVersion`。
 
 ---
 
@@ -541,55 +569,53 @@ f.localcache.Set(key, safeCopy, 5*time.Second)  // safeCopy 是值
 取出来时 `v.(video.Video)` 再取地址，每个请求拿到的是自己的副本。这避免了「一个请求改缓存对象，污染所有请求」的问题。如果塞指针进去，必须保证下游只读。
 
 **代码依据**
-`feed/service.go:94,131-143,175,244`。
+`feed/service.go:118,134-157,178,250`。
 
 ---
 
 ## Q10. Redis 实体缓存与列表缓存是什么关系？视频点赞数变化时要删哪些缓存？如何避免旧数据重新回填？
 
 **一句话结论**
-实体缓存是「一份共享的视频内容」，列表缓存是「一份因用户而异的整页快照」。列表快照里嵌了实体内容，但**两者没有依赖关系**：删实体不会自动更新列表。点赞数变化只删实体，关注流整页缓存不会失效 —— 这是本项目明确的一致性缺口。
+实体缓存是「一份共享的视频内容」；关注流的列表缓存现在只存「这一页有哪些 ID、游标是什么」，**不再嵌实体内容**。所以点赞、改名、删视频只需要失效实体，列表缓存不必跟着清 —— 命中列表后仍会走 `GetVideoByIDs` 重新装配。
 
 **两者对比**
 
 | | 实体缓存 | 列表缓存（关注流） |
 |---|---|---|
-| key | `video:entity:<id>` | `feed:listByFollowing:limit=<n>:accountID=<id>:before=<ms>:id=<id>` |
-| 内容 | 一条视频的完整字段 | 整页渲染结果：视频字段 + 作者 + `LikesCount` + `IsLiked` |
+| key | `video:entity:<id>` | `feed:listByFollowing:v2:limit=<n>:accountID=<id>:before=<ms>:id=<id>` |
+| 内容 | 一条视频的完整字段 | `VideoIDs []uint` + `NextTime` + `NextIDBefore` + `HasMore` |
 | 维度 | 全站共享，一份 | 每人每页一份 |
-| 谁读 | 最新流、热榜、详情页 | 关注流 |
-| TTL | 1h | 24h |
-| 失效 | 点赞/评论/删除时 `DEL` | 关注/取关时按 pattern 删 |
+| 谁读 | 最新流、热榜、详情页、关注流 hydrate | 关注流 |
+| TTL | 1h | 首页 30s；深层页 24h |
+| 失效 | 点赞/评论/删除时 `DEL` + 版本 +1 | 关注/取关时按 pattern 删 |
 
-**点赞数变化时，理论上要删哪些？**
+**点赞数变化时，要删哪些？**
 
 1. `video:entity:<id>`：**已做**。`UpdatePopularityCache` 第一件事就是 `InvalidateVideoEntity`。
-2. 包含这个视频的 `feed:listByFollowing:*`：**没做**。所有用户的关注流整页缓存里都可能嵌着旧的 `LikesCount` 和 `IsLiked`。
+2. `feed:listByFollowing:v2:*`：**不需要**。列表里没有 `LikesCount` / `IsLiked`，下次 hydrate 会从实体或 DB 重新装配。
 3. 热榜 / 最新流：**不需要**。它们只缓存 ID 顺序（ZSET）和实体，内容每次请求都 hydrate；实体删了就会重新装配。
 
-**后果**
+**现在的实际表现**
 
 | 场景 | 实际表现 |
 |---|---|
-| 用户点赞后刷关注流 | 缓存命中时，`IsLiked` 仍是 `false`、`LikesCount` 仍是旧值，最长 24h |
-| 作者改标题 | 关注流里仍是旧标题，最长 24h |
-| 作者删视频 | 已删除的视频还会出现在别人的关注流里，最长 24h |
-| 最新流 / 热榜 | 不受影响：实体被删后下次读会回源 |
+| 用户点赞后刷关注流 | 实体被失效；下一次 hydrate 回源拿到新 `LikesCount`；`IsLiked` 本来就每页现查 |
+| 作者改标题 | 同上，列表不再冻结旧标题 |
+| 作者删视频 | 删除时失效实体并移出热时间线；关注流 hydrate 查不到该 ID，最多受 L1 5s 影响后消失 |
+| 最新流 / 热榜 | 实体被删后下次读会回源 |
 
-> 很多人只讲「改标题 / 删视频」，其实**点赞数**同样脏，而且更频繁。主动说出这一点，说明你真读过 `FeedVideoItem` 的结构。
+> 这里的关键不是「多加了一次 MGET」，而是**把「因用户而异的字段」和「全站共享的内容」分开了**。列表缓存只回答「这一页是谁、下一页从哪开始」，不再回答「这一页长什么样」。
 
-**为什么关注流不改成「只存 ID + 实体装配」？**
-
-这是两条修法：
+**为什么选「只存 ID」而不是「给整页缓存补失效」？**
 
 | 方案 | 做法 | 代价 |
 |---|---|---|
 | A. 补失效 | 视频变更时 `DelByPattern("feed:listByFollowing:*")` | 改一个视频 → 清空**所有人**的关注流缓存，写放大极大 |
-| B. 改结构 | 列表只存 ID + 游标，内容走实体缓存 | 多一次 `MGET`；`IsLiked` 仍要每次算（本来就因人而异） |
+| B. 改结构（已采用） | 列表只存 ID + 游标，内容走实体缓存 | 多一次 `MGET`；`IsLiked` 仍要每页查（本来就因人而异） |
 
-**推荐 B**：失效粒度从「全站」变成「单个实体」，可控得多。但即使选 B，`IsLiked` 仍然无法跨用户共享，因为它是 viewer 维度的。
+失效粒度从「全站」变成「单个实体」，可控得多。`IsLiked` 仍然无法跨用户共享，因为它是 viewer 维度的。
 
-**一个更深的结构问题：实体缓存里混了高频变化字段**
+**一个仍然存在的结构问题：实体缓存里混了高频变化字段**
 
 `video.Video` 同时包含：
 
@@ -605,10 +631,10 @@ f.localcache.Set(key, safeCopy, 5*time.Second)  // safeCopy 是值
 - 这样点赞只更新计数器，不会把整条实体缓存打掉。
 
 **如何避免旧数据重新回填？**
-这是 Q14 的主题。简单说：当前实现**没有防**。读请求在 `DEL` 之后异步回写旧值，可以把旧值重新塞回 Redis 1 小时。修法见 Q14。
+已实现「版本号 + Lua CAS」，见 Q14。读路径在查库前批量读取版本号，回写时版本变了就丢弃；版本号读不到（Redis 故障）则本次不回写。
 
 **代码依据**
-`feed/entity.go:10-20`（`FeedVideoItem` 结构）、`video/popularity_cache.go:60-65`（`InvalidateVideoEntity`）、`social/service.go:94-102`（关注流失效）、`feed/service.go:558`（列表 key）。
+`feed/entity.go`（`FeedVideoItem`）、`feed/service.go:106`（`CachedFollowingPage`）、`feed/service.go:595-755`（关注流 hydrate / 缓存）、`video/video_cache.go:58`（`InvalidateVideoEntity`）、`social/service.go`（关注流失效）、`videocache/entity.go`（key / TTL / CAS）。
 
 ---
 
@@ -696,14 +722,14 @@ for _, id := range missedL2 {
 先承认现状：「我们现在是 20 个 goroutine 单查，为了按 ID 合并」。再给出判断：「主键单行查询本身很便宜，20 条并发查的延迟和 1 条批量差不多；真正的差别是 DB 的 QPS。如果压测显示这里是瓶颈，我会改成先批量查、再按 ID 分发，同时保留 singleflight 作为二次保护」。最后补一句取舍：「批量和合并是矛盾的，选哪个取决于 miss 率和并发形态，不能拍脑袋」。
 
 **代码依据**
-`feed/service.go:197-248`、`feed/repo.go:113-123`（`GetByIDs` 本身支持批量，只是调用方传了单元素）。
+`feed/service.go:235-263`、`feed/repo.go:94-107`（`GetByIDs` 本身支持批量，只是调用方传了单元素）。
 
 ---
 
 ## Q12. Go Redis 客户端的超时、连接池、并发限制如何配置？Redis 超时后降级 MySQL 如何避免流量突然放大？
 
 **一句话结论**
-当前代码只配了 `Addr/Password/DB`，其余全是 go-redis 默认值；**50ms 的 ctx 并没有真正约束 socket 读写**。要让它按设计工作，至少要开 `ContextTimeoutEnabled`、把读写超时压到百毫秒级、配好连接池，并在降级路径上加「快速失败 + 并发闸门 + 不重试」。
+客户端已经显式配置了「超时 + 连接池 + 有限重试 + `ContextTimeoutEnabled`」，50ms 的 ctx 现在是真正生效的 socket 上限；降级路径靠 L1、singleflight、`dbguard` 和连接池四道缓冲，且闸门容量跟着连接池自动伸缩。
 
 ### 12.1 当前配置是什么
 
@@ -712,37 +738,29 @@ rdb := redis.NewClient(&redis.Options{
     Addr:     cfg.Host + ":" + strconv.Itoa(cfg.Port),
     Password: cfg.Password,
     DB:       cfg.DB,
+
+    ContextTimeoutEnabled: true,   // 50ms ctx 真正作用到 socket
+
+    PoolSize:     cfg.PoolSize,     // 默认 64，可用 REDIS_POOL_SIZE 覆盖
+    MinIdleConns: cfg.MinIdleConns, // 默认 8
+    PoolTimeout:  200 * time.Millisecond,
+
+    DialTimeout:  time.Second,
+    ReadTimeout:   time.Second,     // 无 deadline 调用的兜底
+    WriteTimeout: time.Second,
+    MaxRetries:   1,
+    ConnMaxIdleTime: 5 * time.Minute,
 })
 ```
 
-`backend/internal/middleware/redis/redis.go:27-34`，没有 `PoolSize`、`DialTimeout`、`ReadTimeout`、`WriteTimeout`、`MaxRetries`、`ContextTimeoutEnabled`。
+`backend/internal/middleware/redis/redis.go`。池大小与环境变量在 `config/loadconfig.go`（`REDIS_POOL_SIZE`、`REDIS_MIN_IDLE_CONNS`）。
 
-go-redis v9.17.2 的默认值：
+### 12.2 为什么 `ContextTimeoutEnabled` 是关键
 
-| 参数 | 默认值 | 含义 |
-|---|---|---|
-| `PoolSize` | `10 * GOMAXPROCS` | 连接池上限 |
-| `DialTimeout` | 5s | 建连超时 |
-| `ReadTimeout` | 3s | socket 读超时 |
-| `WriteTimeout` | 3s | socket 写超时 |
-| `PoolTimeout` | `ReadTimeout + 1s` = 4s | 池满时等连接的时间 |
-| `MaxRetries` | 3 | 失败重试次数 |
-| `ContextTimeoutEnabled` | **false** | **不把 ctx deadline 传给 socket 读写** |
-
-### 12.2 最关键的发现：50ms 不是真的 50ms
-
-`feed/service.go:157-159`：
+旧实现只配了 `Addr/Password/DB`，而 go-redis v9 默认 `ContextTimeoutEnabled=false`：传给 socket 的 ctx 会被替换成 `context.Background()`，于是上层 `WithTimeout(50ms)` 只剩「等连接」这一步受约束，**socket 读仍受 `ReadTimeout`（默认 3s）约束**。
 
 ```go
-cacheCtx, cancel := context.WithTimeout(ctx, singleRedisOpTimeout) // 50ms
-results, err := f.rediscache.MGet(cacheCtx, cacheKeys...)
-cancel()
-```
-
-代码意图是「Redis 超过 50ms 就降级」。但 go-redis 在 `ContextTimeoutEnabled=false` 时，会把传给 socket 的 ctx 替换成 `context.Background()`：
-
-```go
-// go-redis v9.17.2, redis.go
+// go-redis v9, redis.go
 func (c *baseClient) context(ctx context.Context) context.Context {
     if c.opt.ContextTimeoutEnabled {
         return ctx
@@ -751,89 +769,70 @@ func (c *baseClient) context(ctx context.Context) context.Context {
 }
 ```
 
-于是 `WithReader` 用的是 `ReadTimeout`（3s），不是 ctx 的 50ms。实际行为是：
-
-- **等连接**：受 ctx 约束（50ms）；
-- **socket 读**：最多 3s；
-- **读超时后重试**：`MaxRetries=3`，每次重试前 `internal.Sleep(ctx, backoff)`；此时 ctx 已过期，重试循环会退出。
-- **最坏情况**：一次命令卡 3s，而不是 50ms。
-
-> 这不是「代码写错了」，而是「意图和配置不一致」。面试时主动说出来，比背「50ms 硬超时」更能证明你真的看过客户端源码。
-
-### 12.3 推荐配置
+后果是 Redis 抖动时每个请求最多卡 3s，缓存从「加速层」变成「故障放大器」。修复只需要一个开关：
 
 ```go
-rdb := redis.NewClient(&redis.Options{
-    Addr:         cfg.Host + ":" + strconv.Itoa(cfg.Port),
-    Password:     cfg.Password,
-    DB:           cfg.DB,
-
-    PoolSize:     50,
-    MinIdleConns: 10,
-    PoolTimeout:  100 * time.Millisecond,
-
-    DialTimeout:  200 * time.Millisecond,
-    ReadTimeout:  100 * time.Millisecond,
-    WriteTimeout: 100 * time.Millisecond,
-
-    MaxRetries: 1,                  // 缓存读不要重试太多次，重试会放大故障
-    ContextTimeoutEnabled: true,    // 让 50ms 真正生效
-
-    ConnMaxIdleTime: 5 * time.Minute,
-})
+ContextTimeoutEnabled: true
 ```
+
+现在 50ms 是真实上限；同时保留 1s 的 `ReadTimeout` 作为「调用方没有传 deadline」时的兜底，避免无限等待。
+
+> 面试时这段仍然值得讲：不是背「我们配了 50ms」，而是能说清「为什么默认配置下 50ms 是假的、开关在哪、修完之后的实际上限是多少」。
+
+### 12.3 参数为什么这么定
+
+| 参数 | 当前值 | 依据 |
+|---|---|---|
+| `ContextTimeoutEnabled` | true | 让上层 50ms 成为真实 socket 上限 |
+| `PoolSize` | 64 | 按 Pod 数与 Redis `maxclients` 反推；默认值 10×GOMAXPROCS 不可控 |
+| `MinIdleConns` | 8 | 避免冷启动时集中建连 |
+| `PoolTimeout` | 200ms | 池满快速失败，不让请求排队 4s |
+| `DialTimeout` | 1s | 建连失败要快速暴露 |
+| `ReadTimeout` / `WriteTimeout` | 1s | 无 deadline 调用的兜底；比 50ms 宽，留正常抖动余量 |
+| `MaxRetries` | 1 | 缓存读重试收益低，故障时重试会放大流量 |
+| `ConnMaxIdleTime` | 5min | 及时释放空闲连接，适应 Redis 侧超时/扩缩容 |
 
 要点：
 
-1. **`ContextTimeoutEnabled: true`**：让每个操作的 ctx deadline 真正传到 socket。
-2. **读写超时 100ms 左右**：比 50ms 略宽，给正常抖动留余量；超过就降级。
-3. **`PoolTimeout` 要小**：池满时快速失败，不要排队 4 秒。
-4. **`MaxRetries` 设为 1 或 0**：缓存读的重试收益低，故障时重试会放大流量。
-5. **`MinIdleConns`**：避免冷启动时大量建连。
-6. **连接池按 Pod 配置**：总连接数 = Pod 数 × PoolSize，不能超过 Redis 的 `maxclients`。
+1. **两级超时**：业务显式传 50ms 的 ctx，是「期望预算」；1s 读写超时是「没有预算时的安全网」。
+2. **池大小按 Pod 配置**：总连接数 = Pod 数 × PoolSize，不能超过 Redis 的 `maxclients`。
+3. **重试只留 1 次**：Redis 通常是本地/同可用区，重试多次只会在故障时放大流量。
 
 ### 12.4 并发限制
 
 - **池大小**是硬限制：池满后请求在 `PoolTimeout` 内等连接，等不到就报错。
-- **应用层信号量**：如果担心 Redis 操作把 goroutine 堆满，可以在 `Client` 外面加一个带缓冲 channel 当信号量（和 `dbLoadGate` 同样的做法），限制同时在途的 Redis 操作数。
-- **不要用无界 goroutine 做异步回写**：当前每个 L3 miss 都会 `go func(){ SetBytes(...) }`。Redis 挂掉时，这些 goroutine 会堆积（每个最多卡 3s），没有上限。生产上应该用一个有界 worker 池 + 队列，满了就丢弃并计数。
+- **`dbguard`** 限制同时回源 MySQL 的请求数，间接限制「Redis 全部失败时的下游压力」。
+- **异步回写有界（已做）**：`video.ScheduleEntityWrite` 用 256 个槽位的 channel 限制在途回写，满了直接丢弃并返回 `false`。回写只是加速下一次读，丢了不影响正确性。
+- **没有额外加 Redis 信号量**：池本身已经是硬限制，再套一层只会增加复杂度；真正需要防的是「Redis 失败后涌向 DB」，那由 `dbguard` 负责。
 
 ### 12.5 Redis 超时后降级，如何避免流量突然放大
 
-**先看本项目已有的四道缓冲**
+**本项目已有的四道缓冲**
 
 1. **L1（5s）**：同一实例的重复读不进 Redis，也不进 DB。
 2. **singleflight**：同一进程内同 key 的并发回源合并成 1 次。
-3. **`dbLoadGate`（32/进程，非阻塞）**：拿不到配额直接放弃本次回源，不排队。
+3. **`dbguard`（`MaxOpenConns/2`，非阻塞）**：拿不到配额直接返回过载，不排队。
 4. **连接池上限（64）**：驱动层硬闸门，避免把 MySQL 的 `max_connections` 打满。
 
 **为什么「不排队」很重要**
 
 排队只是把压力从数据库搬到应用内存：请求在 goroutine / channel 里等着，连接池仍然会被慢查询占满，最终还是会压到 DB。非阻塞 + 快速失败才是真正的「减量」。
 
-**还不够的地方**
+**还剩的缺口**
 
 | 缺口 | 后果 | 补法 |
 |---|---|---|
-| 闸门是**每进程**的 | 10 个 Pod = 320 并发，可能超过 MySQL 容量 | 按 MySQL 实测容量定 `maxConcurrentDBLoad`；或做全局令牌桶 |
-| 闸门只覆盖实体和关注流 | 最新流冷区、热榜兜底、点赞榜、话题流仍可打满 DB | 把这些 DB 入口也纳入统一闸门 |
+| 闸门是**每进程**的 | 10 个 Pod = 320 并发，可能超过 MySQL 容量 | 按 MySQL 实测容量定 `MYSQL_MAX_OPEN_CONNS`；或做全局令牌桶 |
 | 没有熔断 | Redis/DB 持续慢时，每个请求仍要等超时 | 接 `sony/gobreaker`，失败率/延迟超阈值直接快速失败，半开探测 |
-| 读超时实际 3s | 降级前每个请求卡 3s，goroutine 堆积 | 开 `ContextTimeoutEnabled` + 100ms 读写超时 |
-| 无界异步回写 | Redis 故障时 goroutine 增长 | 有界 worker 池 + 丢弃计数 |
-| `maxConcurrentDBLoad` 不随配置变化 | 调大 `MYSQL_MAX_OPEN_CONNS` 后闸门仍是 32 | 从 `DatabaseConfig` 计算，而不是用包级常量初始化 |
+| 没有全局限流 | HTTP 层限流本身依赖 Redis，Redis 挂了会放行；Feed 读没挂限流 | 网关层按路由做本地/全局限流 |
 | 无指标 | 不知道闸门拒绝多少、降级多少次 | 暴露 `db_gate_rejected_total`、`redis_fallback_total`、各级命中率 |
+| Redis 无高可用 | 单点故障只能靠应用降级 | 哨兵/集群；本项目的假设是「Redis 会挂」，所以降级链路必须先成立 |
 
-**`maxConcurrentDBLoad` 的这个细节值得单独说**
-`backend/internal/feed/service.go:68`：
-
-```go
-var maxConcurrentDBLoad = config.DefaultMaxConcurrentDBLoad
-```
-
-它在包初始化时取常量 32。即使用 `MYSQL_MAX_OPEN_CONNS=128` 把连接池调大，闸门仍然是 32。注释里写「这里也要同步调大」，但代码没有自动同步 —— 这是一个配置耦合缺口，面试时可以作为「我知道边界」的素材。
+**闸门容量怎么跟着连接池走**
+`db.NewDB` 在设置完 `SetMaxOpenConns` 之后调用 `dbguard.Configure(dbcfg.MaxOpenConns)`，容量取一半（至少 1）。这样 `MYSQL_MAX_OPEN_CONNS=128` 时闸门自动变成 64，不会出现「池子调大了、闸门还是旧值」的脱节。剩余一半留给写路径、事务、迁移以及其他包的查询。
 
 **代码依据**
-`middleware/redis/redis.go:27-34`、`feed/service.go:28,68,96,157-159`、`video/popularity_cache.go:73-93`、`db/db.go:36-38`、`config/loadconfig.go:34-39`。
+`middleware/redis/redis.go`、`config/loadconfig.go`（`RedisConfig.Normalize`）、`feed/service.go:28`、`video/video_cache.go:100-130`、`dbguard/dbguard.go`、`db/db.go`。
 
 ---
 
@@ -842,7 +841,7 @@ var maxConcurrentDBLoad = config.DefaultMaxConcurrentDBLoad
 ## Q13. Redis 整个集群不可用，所有请求都降级到 MySQL，数据库如何避免被打垮？
 
 **一句话结论**
-靠「L1 + singleflight + 连接池上限 + 回源闸门」把并发压住，但这是**有上限的降级**，不是完整保护：没有熔断、没有全局限流、闸门只管住了部分入口。
+靠「L1 + singleflight + 连接池上限 + 统一回源闸门 `dbguard`」把并发压住，所有 Feed 读路径的 DB 入口都已接入闸门；但这是**有上限的降级**，仍然没有熔断和全局限流。
 
 **Redis 挂掉时发生什么**
 
@@ -851,16 +850,18 @@ GetVideoByIDs:
   MGET 报错 / 超时
     → missedL2 = missedL1（全量降级）
     → 每个 miss 起 goroutine，走 singleflight
-    → leader 抢 dbLoadGate
+    → leader 抢 dbguard
         ├─ 抢到：查库
-        └─ 抢不到：返回 nil，该条不出现在结果里（200，但缺数据）
+        └─ 抢不到：返回 ErrServiceOverloaded
+    → 只要有 ID 失败，GetVideoByIDs 返回聚合错误
+        → handler 映射 503（过载）/ 500（其他 DB 错误）
 
 ListByFollowing:
     GET 连接错误（不是 IsMiss）
       → 直接落到 doListByFollowingFromDB
-      → 抢 dbLoadGate
+      → 抢 dbguard
           ├─ 抢到：昂贵 JOIN
-          └─ 抢不到：errDBOverloaded → 503
+          └─ 抢不到：ErrServiceOverloaded → 503
 ```
 
 **四道防线及其真实作用**
@@ -869,8 +870,10 @@ ListByFollowing:
 |---|---|---|
 | L1 5s | 吸收同实例重复读 | 5s 后失效；跨实例无效 |
 | singleflight | N → P（每 Pod 1 次） | 不是 N → 1；只压并发，不压总量 |
-| `dbLoadGate` 32/进程 | 限制同时回源的请求数 | 每进程；不排队；只覆盖实体 + 关注流 |
+| `dbguard`（`MaxOpenConns/2`） | 限制同时回源的请求数 | 每进程；不排队 |
 | 连接池 64 | 防止无限建连打满 MySQL | 超出的请求在应用侧排队，仍可能拖高延迟 |
+
+闸门覆盖的入口：实体回源（Feed + `GetDetail`）、最新流冷区与回源、关注流 JOIN、话题标签、热榜 MySQL 兜底、话题流、`IsLiked` 批量查询。`IsLiked` 是例外策略：闸门满时它降级成 `is_liked=false`，不拖垮整页。
 
 **「TTL 随机抖动」有用吗？**
 **对 Redis 整体不可用完全无效。** 抖动防的是「大量 key 同时过期」，而这里是缓存层不响应了，key 过没过期没有意义。这是本题最常见的错误答案。
@@ -878,11 +881,10 @@ ListByFollowing:
 **还没做的（主动披露）**
 
 1. **熔断**：DB 错误率 / 延迟超阈值时快速失败，给下游恢复窗口。没有真实流量校准阈值，所以没硬做。
-2. **全局限流**：HTTP 层的限流是 Redis 计数，**Redis 挂了直接放行**（`ratelimit.go:35-38`），而且 Feed 读接口根本没挂限流。
-3. **统一闸门**：最新流冷区、热榜 MySQL 兜底、点赞榜、话题流都没有接 `dbLoadGate`。
-4. **指标**：闸门拒绝数、降级次数、各级命中率都没有埋点。
-5. **Redis 高可用**：没有哨兵 / 集群；架构上假设 Redis 会挂，靠应用层降级，而不是靠 Redis 不挂。
-6. **响应码不一致**：关注流回源过载是 503（`feed/handler.go:142`），最新流 / 热榜是硬编码 500（`feed/handler.go:47` 等）—— 同样是过载，客户端收到的信号不一致。
+2. **全局限流**：HTTP 层的限流是 Redis 计数，**Redis 挂了直接放行**，而且 Feed 读接口根本没挂限流。
+3. **指标**：闸门拒绝数、降级次数、各级命中率都没有埋点。
+4. **Redis 高可用**：没有哨兵 / 集群；架构上假设 Redis 会挂，靠应用层降级，而不是靠 Redis 不挂。
+5. **「部分失败」的体验**：现在只要有 ID 回源失败就整页 5xx，客户端拿不到已成功的部分。这是「不静默短页」的代价；更精细的做法是返回 `degraded` 标记 + `missing_ids`。
 
 **上生产会怎么补**
 
@@ -892,8 +894,8 @@ ListByFollowing:
   1. Redis 熔断（gobreaker）：失败率高 → 直接跳过 L2
   2. DB 熔断：慢查询比例高 → 快速失败，半开探测
   3. 全局回源令牌桶（Redis 可用时用 Redis，不可用时退化为本地令牌桶）
-  4. 所有 DB 入口统一走闸门
-  5. 有界异步回写 worker 池
+  4. 闸门已统一，后续是压测校准容量
+  5. 异步回写已有界，后续补丢弃计数
   6. 指标 + 告警：降级率、闸门拒绝、DB P99、连接池使用率
 存储层：
   7. Feed 读走只读副本；主库只承担写
@@ -901,33 +903,35 @@ ListByFollowing:
 ```
 
 **面试话术**
-> 「Redis 全挂时我们是全量降级，singleflight 只能把 N 收敛到 P，所以真正的保护是两道闸门：连接池上限和应用层回源闸门。闸门是非阻塞的，拿不到配额就放弃本次回源，因为排队只是把堆积从数据库搬到应用内存。
-> 但我不会说这就够了：闸门是每进程的，只覆盖了实体和关注流，没有熔断，也没有全局限流。上线前我会先补指标，再用压测校准容量，最后才是熔断阈值 —— 没有数据就拍一个熔断阈值，比没有熔断更危险。」
+> 「Redis 全挂时我们是全量降级，singleflight 只能把 N 收敛到 P，所以真正的保护是两道闸门：连接池上限和应用层回源闸门。闸门是非阻塞的，拿不到配额就返回过载，因为排队只是把堆积从数据库搬到应用内存。所有 Feed 的 DB 入口现在都走同一个闸门，容量跟着连接池自动算。
+> 但我不会说这就够了：闸门是每进程的，没有熔断，也没有全局限流。上线前我会先补指标，再用压测校准容量，最后才是熔断阈值 —— 没有数据就拍一个熔断阈值，比没有熔断更危险。」
 
 ---
 
 ## Q14. Redis 恢复后，旧请求的查询结果才写回缓存，可能覆盖较新的数据。你怎么解决这个竞态？
 
 **一句话结论**
-本项目目前**没有解决**这个竞态。读请求在 `DEL` 之后异步回写旧值，确实可以把旧数据重新塞回 Redis 1 小时。严格的修法是「版本号 + CAS 回写」，便宜的缓解是「延迟双删」，结构性的修法是「把高频变化字段从实体缓存里拆出去」。
+实体缓存已经用「失效版本号 + Lua CAS」解决了这个竞态：每次失效原子地 `INCR version` 并 `DEL entity`，读路径在查库前记下版本，回写时版本变了就丢弃。关注流的**列表成员**缓存仍不是严格的：在途的 `setCached` 可能把刚取关的一页写回去，影响限于该页 TTL（首页 30s / 深层 24h），但页内内容每次都会重新装配。
 
-**竞态时间线**
+**竞态时间线（修复前 / 修复后）**
 
 ```text
-t0  请求 A：L2 miss，开始查库
-t1  A 从 MySQL 读到 likes_count=100
-t1.5 点赞请求：MySQL 更新为 101，随后 DEL video:entity:123
-t2  A 的异步 goroutine 执行 SetBytes(video:entity:123, 旧值 100, TTL 1h)
-      → Redis 里重新出现 100，且活 1 小时
-t2+ 所有 Pod 的后续读都命中这份旧值（L1 5s 后重新从 Redis 读到 100）
+t0    请求 A：L2 miss，读 version=7，开始查库
+t1    A 从 MySQL 读到 likes_count=100
+t1.5  点赞请求：MySQL 更新为 101
+      → INCR version = 8；DEL video:entity:123（同一个 Lua 原子完成）
+t2    A 的异步回写：CAS 比较 version，发现 8 != 7
+      → 放弃写入，旧值 100 不会复活
 ```
+
+如果没有版本号，t2 的 `SET` 会把 100 重新塞回 Redis 并活 1 小时 —— 这就是旧实现的问题。
 
 **代码依据**
 
-- 读库：`feed/service.go:211`
-- 异步回写：`feed/service.go:225-235`
-- 失效：`video/popularity_cache.go:65` → `video/video_cache.go:62-67`
-- 失效的错误被丢弃：`_ = cache.Del(...)`
+- 失效：`videocache/entity.go` 的 `invalidateScript`（`INCR` + `PEXPIRE` + `DEL` 一次 EVAL）
+- 版本读取：`video/video_cache.go` 的 `EntityVersion`；Feed 用一次 MGET 批量取
+- 回写：`video/video_cache.go` 的 `SetVideoEntityIfVersion` → `videocache.SetIfVersion`
+- 异步调度：`video.ScheduleEntityWrite`（256 槽位，有界）
 
 **为什么「先更新 DB，再删缓存」还是不够？**
 
@@ -951,34 +955,37 @@ t2+ 所有 Pod 的后续读都命中这份旧值（L1 5s 后重新从 Redis 读�
 
 **四种修法，按严格程度排序**
 
-### 方案 1：版本号 + Lua CAS（推荐，严格）
+### 方案 1：失效版本号 + Lua CAS（已实现）
 
-给 `videos` 表加一个单调递增的 `version`（或直接用 `updated_at` 的纳秒值），缓存值里也带上：
+关键点：版本号放在 **Redis 的失效 epoch** 上，不是给 `videos` 表加字段。
 
-```json
-{"id":123,"likes_count":101,"version":42,...}
+```text
+失效（写路径）:
+  EVAL "INCR ver; PEXPIRE ver 25h; DEL entity"   ← 原子，避免回写插在两条命令之间
+读取（回源前）:
+  MGET video:entity:ver:<id>...                  ← 批量，和实体 MGET 同一份预算
+回写（查库后）:
+  EVAL "if GET ver ~= 读到的版本 then return 0
+        SET entity payload PX 1h; return 1"
 ```
 
-回写时用 Lua 比较：
+为什么版本必须在**查库之前**读：失效可能发生在「查库之后、回写之前」，那时查回的是旧值，CAS 必须失败。读不到版本（Redis 故障）时本次不回写，因为比较基准不可信。
+
+为什么版本 TTL 要 25h：它必须明显长于实体 TTL（1h）。版本比实体先过期的话，一次迟到的旧值回写会重新通过校验。
 
 ```lua
--- KEYS[1] = video:entity:123
--- ARGV[1] = 新值 JSON
--- ARGV[2] = 新版本号
-local cur = redis.call('GET', KEYS[1])
-if cur then
-  local ok, obj = pcall(cjson.decode, cur)
-  if ok and obj.version and tonumber(obj.version) > tonumber(ARGV[2]) then
-    return 0   -- 缓存里已经是更新的版本，拒绝旧值
-  end
+-- KEYS[1] = entity, KEYS[2] = version
+local cur = redis.call('GET', KEYS[2])
+if (cur or '') ~= ARGV[2] then
+  return 0   -- 期间发生过失效，旧值丢弃
 end
-redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
 return 1
 ```
 
-- 优点：从根上消除「旧写覆盖新写」，不依赖时序。
-- 代价：多一个版本字段；回写从 `SET` 变成 `EVAL`；DB 更新要维护版本号。
-- 注意：哨兵值也要带版本，或者干脆不参与 CAS。
+- 优点：从根上消除「旧写覆盖新写」，不依赖时序，也不需要延迟双删那种 sleep。
+- 代价：每次 miss 多一次版本 MGET；回写从 `SET` 变成 `EVAL`。
+- 边界：它保证「失效之后不会写回旧值」，但**不解决「两个写请求本身乱序更新 DB」** —— 那是写路径的 CAS/版本问题，缓存层管不了。
 
 ### 方案 2：延迟双删（便宜，但不是证明）
 
@@ -1009,15 +1016,20 @@ DB 更新后直接把新值 `SET` 进缓存（而不是 `DEL`），并带版本�
 这样从根上减少「读旧实体 + 写回」的机会，也解决 Q10 里「越热越容易失效」的反模式。代价是读路径多一次合并，结构更复杂。
 
 **本项目选哪个？**
-当前一个都没选。面试时应该：
+选方案 1，已落地（见上）。面试时应该：
 
-1. 先承认竞态存在，并说清时间线；
-2. 说明当前靠 L1 5s 把**本地**影响压小，但 Redis 的 1h TTL 让**跨实例**影响被放大；
-3. 给出首选方案（版本 CAS）和过渡方案（延迟双删）；
-4. 如果面试官追问「为什么现在不做」，回答：项目没有真实并发写压测，版本字段会改动表结构和所有回写路径，收益需要先有指标证明；但这是明确的技术债，不是「不知道」。
+1. 先画时间线，说明「先 DB 后 DEL」防不住已在途的读；
+2. 说明修复的三个细节：失效要原子、版本要在查库前读、版本 TTL 要长于实体 TTL；
+3. 主动说边界：CAS 保证「失效后不回填旧值」，不保证「并发写本身有序」；
+4. 再说没做的：拆分高频字段（点赞数独立计数器）仍是结构优化项，因为它影响命中率，不影响正确性。
 
-**同一竞态也存在于关注流**
-`ListByFollowing` 的 `setCached` 也是在 DB 查询之后写整页缓存；关注/取关的 `DelByPattern` 可能被在途的 `setCached` 覆盖。修法同理：版本号，或者接受 24h 脏窗口。
+**剩下的竞态：关注流列表成员**
+`ListByFollowing` 的 `setCached` 也是在 DB 查询之后写 ID 页；并发取关的 `DelByPattern` 可能被在途的 `setCached` 覆盖，导致刚取关的作者视频重新出现。影响被两个设计压小：
+
+- 页内内容每次 hydrate，作者信息/点赞/删除状态不会冻结；
+- 首页 TTL 只有 30s，只有深层页会持续到 24h。
+
+要严格解决同样需要版本号（按 account 或按页），但收益低于实体路径，暂不做。
 
 ---
 
@@ -1027,15 +1039,15 @@ DB 更新后直接把新值 `SET` 进缓存（而不是 `DEL`），并带版本�
 因为 L1 是**每个进程各自的一份内存**，写路径只删 Redis，没有任何跨实例通知。不同 Pod 的 L1 在不同时刻过期，所以在窗口内会返回不同结果。处理方式只有三类：缩短 TTL、广播失效、或者让强一致字段绕开 L1。
 
 **先纠正一个前提：本项目 Feed 里没有头像**
-`FeedAuthor` 只有 `ID` 和 `Username`（`feed/service.go:877`），没有 `AvatarURL`。所以「更新头像导致 Feed 不一致」在本项目不成立。但同类问题真实存在，而且更严重：
+`FeedAuthor` 只有 `ID` 和 `Username`（`feed/service.go:1134`，`buildFeedVideos`），没有 `AvatarURL`。所以「更新头像导致 Feed 不一致」在本项目不成立。但同类问题真实存在，而且更严重：
 
 | 字段 | 存在哪 | 更新时会失效什么 | 实际脏多久 |
 |---|---|---|---|
-| `videos.username` | `videos` 表的反范式列 + 实体缓存 + 关注流整页缓存 | **什么都不失效** | 实体 1h；关注流 24h；**DB 里旧视频也永远不更新** |
-| `LikesCount` / `Popularity` | `videos` 表 + 实体缓存 + 关注流整页缓存 | 只删实体 | 实体路径毫秒级；关注流 24h |
-| 视频标题 / 封面 / 删除 | `videos` 表 + 实体缓存 + 关注流整页缓存 | 只删实体 | 关注流 24h |
+| `videos.username` | `videos` 表的反范式列 + 实体缓存 | 改名事务同步所有历史视频的 `username`，并逐个失效实体缓存；关注流只存 ID，hydrate 时重算 | 其他实例的 L1 ≤ 5s；DB 不再是永久旧值 |
+| `LikesCount` / `Popularity` | `videos` 表 + 实体缓存 | 只删实体（版本 +1）；关注流 hydrate 重算 | 其他实例的 L1 ≤ 5s |
+| 视频标题 / 封面 / 删除 | `videos` 表 + 实体缓存 | 只删实体（删除还移出热时间线）；关注流 hydrate 重算 | 其他实例的 L1 ≤ 5s |
 
-> `Rename`（`account/service.go:45-68`）只更新 `accounts.username` 并重签 token，既不更新 `videos.username`，也不失效 `video:entity`。所以这不是 L1 的锅，是反范式字段没有同步 —— 而 L1 只是把窗口再放大 5 秒。
+> `Rename`（`account/service.go`）现在在**同一个事务**里更新 `accounts.username`、重签 token，并 `UPDATE videos SET username=? WHERE author_id=?`，返回受影响的视频 ID；事务提交后逐个 `videocache.Invalidate`。不这么做的后果是：旧视频永久显示旧名字，且实体缓存还会再冻 1 小时。
 
 **为什么不同实例结果不同**
 
@@ -1083,58 +1095,58 @@ L1 的 TTL 是 5s，所以这个窗口最多 5s。**这是 L1 短 TTL 存在的�
 ## Q16. 如果数据库查询也失败，你说的「接口零报错」是否仍然成立？简历里的「零报错」具体指什么？
 
 **一句话结论**
-**不成立。** 严格说，「零报错」只在「Redis 故障、MySQL 正常」时成立；MySQL 失败时，实体装配路径会**静默丢条**（200 但少数据），关注流会 500/503，冷区查询会 500。简历里这句话必须限定范围。
+**部分成立。** 「Redis 故障不导致 5xx」仍然成立；但 MySQL 查实体失败现在会**显式返回 500/503**，不再静默返回短页。「零报错」必须限定为「不因缓存层故障而报错」。
 
-**把「零报错」拆成四种情况**
+**把「零报错」拆成几种情况**
 
 | 故障 | 实际行为 | 是否 5xx | 数据是否完整 |
 |---|---|---|---|
-| Redis 超时 / 报错，MySQL 正常 | `missedL2 = missedL1`，全部回源 | 否 | 完整（闸门未满时） |
-| Redis 正常，MySQL 查实体失败 | `GetVideoByIDs` 忽略单条错误，结果里跳过该条 | **否（200）** | **不完整，且调用方不知道** |
+| Redis 超时 / 报错，MySQL 正常 | `missedL2 = missedL1`，全部回源；本次不回写 | 否 | 完整（闸门未满时） |
+| Redis 正常，MySQL 查实体部分失败 | 返回聚合错误，整页失败 | **是（500）** | 不返回残缺页 |
+| 回源闸门满（任意入口） | `dbguard.ErrOverloaded` | **是（503）** | 不返回残缺页 |
 | 关注流 MySQL 失败 | 返回 error | 500 | 不完整 |
-| 关注流回源闸门满 | `errDBOverloaded` | **503** | 不完整 |
-| 最新流冷区 MySQL 失败 | 返回 error | 500 | 不完整 |
-| 最新流热区实体查库失败 | `GetVideoByIDs` 吞掉错误 | **否（200）** | 不完整（可能整页只剩几条） |
-| 热榜 MySQL 兜底失败 | 返回 error | 500 | 不完整 |
+| 最新流冷区 MySQL 失败 | 返回 error | 500/503 | 不完整 |
+| 热榜 MySQL 兜底失败 | 返回 error | 500/503 | 不完整 |
+| `IsLiked` 批量查询失败 / 闸门满 | 降级为 `is_liked=false` 并打日志 | 否 | **辅助字段不完整** |
 
-**关键代码：`GetVideoByIDs` 根本不返回 L3 的错误**
+**关键代码：`GetVideoByIDs` 现在会返回 L3 的错误**
 
 ```go
-v, err, _ := video.EntityLoadGroup.Do(...)
-if err == nil && v != nil {
-    // 放进结果
+// 每个 ID 的失败都会被累计；gate shed 单独计数
+if err := dbguard.Do(...); err != nil {
+    return nil, err
 }
-// err != nil 时什么都不做，也没有累计错误
 ...
-wg.Wait()
-return buildOrderedResult(videoIDs, videoMap), nil   // ← 永远返回 nil error
+if firstErr != nil {
+    return result, fmt.Errorf("feed: hydrate %d/%d videos from DB failed (gate shed %d): %w",
+        failed, len(missedL2), shed, firstErr)
+}
+return result, nil
 ```
 
-结果是：
+为什么必须抛：返回「短页 + nil error」时，客户端会把数据库故障当成「到底了」，不会重试；热榜还会按已取出的 member 数推进 offset，把失败的那几条**永久跳过**。用 `%w` 包住原错误，handler 里的 `apierror.ClassifyHTTPStatus` 仍能识别 `ErrServiceOverloaded` 并映射 503。
 
-- 20 个视频里 5 个查库失败 → 返回 15 条，HTTP 200；
-- 20 个全失败 → 返回空数组，HTTP 200；
-- 调用方无法区分「视频被删了」和「数据库挂了」。
+代价要说清楚：现在**一条失败就整页失败**，已成功装配的部分不会返回。这是「宁可报错，也不静默缺数据」的取舍；更精细的 `degraded` 标记还没做。
 
-这比返回 500 更危险：客户端会认为「这一页就这些」，不会重试；监控也看不到错误率上升。
+**唯一仍然静默降级的地方：`IsLiked`**
+`buildFeedVideos` 里 `BatchGetLiked` 也走闸门；失败时降级成「都没点过」并记日志。它不改变视频内容是否完整，只影响按钮状态；而且点赞写入有唯一索引兜底，重复点不会写坏数据。面试时要主动区分：**内容字段失败要报错，辅助字段失败可以降级**。
 
 **简历里的「零报错」到底该怎么写**
 
 - 现在这句话的准确含义：**Redis 故障期间，读接口不会因为 Redis 报错而返回 5xx**。
-- 不包含：MySQL 故障、闸门拒绝、部分数据缺失。
+- 不包含：MySQL 故障、闸门拒绝。这些现在会明确返回 500/503。
 - 更严谨的写法：
-  > 「Redis 不可用时读接口降级直查 MySQL，不因缓存故障返回 5xx；实体装配按条降级，单条失败不会拖垮整页。」
-- 如果继续用「零报错」，面试官一问「数据库也挂了呢」就会打穿。**主动限定范围，比被追问后改口好。**
+  > 「Redis 不可用时读接口降级直查 MySQL，不因缓存故障返回 5xx；MySQL 也失败时快速失败并返回 5xx，不返回静默缺页的结果。」
 
 **怎么改才算真正的「可控降级」**
 
-1. **区分错误类型**：`GetVideoByIDs` 返回 `(videos, degraded bool, err error)`，或者定义一个 `PartialResultError`。
-2. **全失败要报错**：如果一个都没查到，且不是「确实不存在」，返回 503/500，让客户端重试。
-3. **部分失败要标记**：响应里加 `degraded: true` 或 `missing_ids`，前端可以提示「加载不完整」。
-4. **指标**：`entity_load_failed_total`、`partial_page_total`、`db_gate_rejected_total`。
-5. **区分「不存在」和「查询失败」**：前者写哨兵，后者绝对不能写哨兵 —— 否则会把数据库故障缓存成「视频不存在」，持续 60 秒。
+1. **区分错误类型**：`GetVideoByIDs` 返回聚合错误并保留原错误链；已做。
+2. **全失败/部分失败要报错**：已做（整页失败）。
+3. **响应里标记部分失败**：返回 `degraded: true` / `missing_ids`，让前端提示「加载不完整」；未做。
+4. **指标**：`entity_load_failed_total`、`partial_page_total`、`db_gate_rejected_total`；未做。
+5. **区分「不存在」和「查询失败」**：已做。前者写哨兵，后者绝不写 —— 否则会把数据库故障缓存成「视频不存在」，持续 60 秒。
 
-> 第 5 点尤其重要：如果查库失败时误写 `__null__`，故障会被放大成「大量视频消失」。当前代码只在 `len(videoList)==0` 时写哨兵，`err != nil` 不写，这个边界是对的，要能说出来。
+> 第 5 点尤其重要：如果查库失败时误写 `__null__`，故障会被放大成「大量视频消失」。当前代码只在 `len(videoList)==0` 且 `err == nil` 时写哨兵，这个边界是对的，要能说出来。
 
 **「热点数据请求不再穿透 MySQL」也要限定**
 它成立的前提是「L1 或 L2 命中」。缓存过期 / 冷启动 / Redis 故障时，请求仍然会到 MySQL —— 只是被 singleflight 合并成「每 Pod 每 key 一次」。不要把它说成「永远不会到 MySQL」。
@@ -1153,7 +1165,7 @@ L1 命中 → videoMap[id] = &data; continue
         → 如果所有 ID 都命中，直接 return buildOrderedResult(...)
 ```
 
-`feed/service.go:131-147`。L1 在 L2 之前，所以「Redis 没有、L1 有」的结果就是：这次请求完全不碰 Redis 和 MySQL。
+`feed/service.go:134-157`。L1 在 L2 之前，所以「Redis 没有、L1 有」的结果就是：这次请求完全不碰 Redis 和 MySQL。
 
 **但要先纠正一个常见前提**
 本项目的 L1 TTL（5s）远小于 Redis TTL（1h）。正常情况下是 **L1 先过期，Redis 还在**，不是反过来。「Redis 过期但 L1 还在」只在以下情况出现：
@@ -1174,9 +1186,9 @@ L1 命中 → videoMap[id] = &data; continue
 | 3 | **多个热点 key 同时失效** | 每个 key 各 1 次/Pod，P × K 次回源 | 存在；闸门按请求数限，不按 key |
 | 4 | **热点 key 在 Redis 被删/丢失** | 写路径每次点赞都 `DEL` 实体，热门视频反复 miss | 存在；L1 5s + singleflight 扛 |
 | 5 | **leader 卡住** | `Do` 不接收 ctx，follower 永久阻塞；DB 慢查询会把 goroutine 堆满 | 存在；B2 短板 |
-| 6 | **闸门已满** | 实体路径直接丢弃该条，返回 200 但缺数据 | 存在；非阻塞降级 |
+| 6 | **闸门已满** | 回源请求被主动拒绝，整页返回 503 | 存在；非阻塞降级，不再静默缺条 |
 | 7 | **连接池耗尽** | 回源请求在池上排队，P99 飙升；更多请求堆积 | 存在；64 上限 |
-| 8 | **热榜快照缺失后回落 MySQL** | `ZRevRange` 对不存在的 key 返回空且不报错，首页会落到 `ListByPopularity`，而这条路径**没有闸门** | 存在；这是 Q13 的隐藏入口 |
+| 8 | **热榜快照缺失后回落 MySQL** | `ZRevRange` 对不存在的 key 返回空且不报错，首页会落到 `ListByPopularity`；该路径已接闸门，但仍然是「缓存缺失 → 打 DB」 | 存在；闸门兜底 |
 
 **第 8 点展开（很容易被忽略）**
 
@@ -1190,13 +1202,18 @@ if err == nil && len(members) == 0 {
     // offset == 0 时继续往下走
 }
 ...
-videos, err := f.repo.ListByPopularity(...)   // ← MySQL 兜底，没接 dbLoadGate
+if err := dbguard.Do(func() error {          // ← 已接入统一闸门
+    videos, err = f.repo.ListByPopularity(...)
+    return err
+}); err != nil {
+    return resp, err                          // ← 过载映射 503
+}
 ```
 
 - 快照重建失败时，`ensureHotSnapshot` 只打日志；
 - `ZRevRange` 对不存在的 key 返回空、不报错；
 - 首页请求于是落到 MySQL 的 `ORDER BY popularity DESC`；
-- 这条查询没有回源闸门，Redis 故障时所有用户一起打它。
+- 这条查询已经接闸门，Redis 故障时不会无限打 DB，但「快照缺失 → 回源」的放大效应本身仍在。
 
 这是一个「缓存层故障 → 静默降级 → 打 DB」的典型链路，也是「三级缓存防不住」的实例。
 
@@ -1216,7 +1233,7 @@ videos, err := f.repo.ListByPopularity(...)   // ← MySQL 兜底，没接 dbLoa
 2. **跨 Pod 合并**：用 Redis SETNX 保护实体回源。按 6.2 的账，主键查询用 SETNX 不划算（省 0.9ms DB，付 600ms Redis），所以不做。
 3. **逻辑过期**：value 里带逻辑过期时间，过期后仍返回旧值 + 异步重建。可以彻底消除「过期瞬间回源」，但会引入「读到过期数据」的语义，且需要额外的重建锁。
 4. **热点探测 + 主动续期**：识别 QPS 最高的 key，在 TTL 到期前主动延长（比如 1h → 2h），避免热点 key 过期。这是生产上常见的做法，本项目没做。
-5. **统一闸门 + 熔断 + 指标**：见 Q13。
+5. **统一闸门已做；剩下熔断 + 指标**：见 Q13。
 
 **面试话术**
 > 「L1 命中就不会回源，这是代码顺序决定的。但三级缓存不是万能的：singleflight 只到 Pod 级，L1 和 Redis 可能同时缺失，热门视频的实体缓存还会被每次点赞删掉。真正防不住的是『缓存整体缺失 + 跨 Pod 并发 + DB 容量不足』这三件事同时发生。所以我补了连接池上限和回源闸门，但它们也只是把伤害限制在可控范围，不是消除。」
@@ -1228,22 +1245,22 @@ videos, err := f.repo.ListByPopularity(...)   // ← MySQL 兜底，没接 dbLoa
 | # | 问题 | 一句话答案 |
 |---|---|---|
 | 1 | 为什么三级？只用 Redis？L1 的问题？ | 内存→网络→磁盘的代价阶梯；只用 Redis 热点集中、每次都有 RTT；L1 带来多实例不一致、内存不可控、冷启动、排障难 |
-| 2 | TTL 怎么定？ | L1 5s = 跨实例脏窗口；实体 1h = DEL 失败兜底；列表 24h = 失效不完整的损失上界；都是工程估算，不是压测调参 |
-| 3 | 穿透/击穿/雪崩？ | 击穿=singleflight/SETNX；穿透=`__null__` 哨兵 60s；雪崩=连接池 64 + 闸门 32；抖动只防「同时过期」，不防「Redis 挂了」 |
+| 2 | TTL 怎么定？ | L1 5s = 跨实例脏窗口；实体 1h = DEL 失败兜底；关注流首页 30s / 深层 24h = 成员变化上界；都是工程估算，不是压测调参 |
+| 3 | 穿透/击穿/雪崩？ | 击穿=singleflight/SETNX；穿透=`__null__` 哨兵 60s；雪崩=连接池 64 + 统一闸门 32；回写用版本 CAS 防旧值复活；抖动只防「同时过期」，不防「Redis 挂了」 |
 | 4 | singleflight vs mutex？ | 按 key 合并并发并共享返回值；mutex 只串行化，等待者还要自己执行；用 mutex 要自己管 per-key 锁 + double check + 结果传递，等于重造 singleflight |
 | 5 | MGET 优势？ | 1 次 RTT vs N 次；代价是全有或全无，所以降级也是全量；集群下注意 CROSSSLOT |
 | 6 | 1000 并发同一视频，DB 几次？ | 单 Pod 1 次；P 个 Pod P 次；Redis 仍收 1000 次 MGET；leader 的 ctx 取消会连累所有 follower |
 | 7 | Group 粒度？ | 每类数据源一个 Group，key 带实体 ID；全局重建用全局 key，分页用参数化 key；判据是「结果能否互换」 |
 | 8 | 合并了但没写缓存？ | 当前批正常；同 Pod 5s 内靠 L1；之后重新回源；singleflight 不是缓存，压并发不压总量 |
 | 9 | 本地缓存怎么实现？ | go-cache：RWMutex + map + 过期时间 + janitor；无容量上限、无 LRU；过期懒判断 + 5s 清理；可换 ristretto/bigcache |
-| 10 | 实体 vs 列表？点赞删什么？ | 实体共享、列表因人而异；点赞只删实体，关注流整页缓存不失效 → `IsLiked`/`LikesCount` 脏 24h；建议列表只存 ID |
+| 10 | 实体 vs 列表？点赞删什么？ | 实体共享、列表因人而异；关注流列表只存 ID+游标，点赞只删实体，页内字段 hydrate 时重算，不再冻 24h；剩余问题是实体里混了 LikesCount 高频字段 |
 | 11 | MGET 100 缺 20，怎么批量？ | 现状 20 个 goroutine 单查，为了按 ID 合并；可改「先批量查再按 ID 分发」，代价是合并率下降；批量与合并是矛盾的 |
-| 12 | Redis 客户端怎么配？降级怎么不放大？ | 现在只配了地址密码；50ms ctx 因 `ContextTimeoutEnabled=false` 不约束 socket，实际读 3s；建议开 true、100ms 读写、池 50、重试 1；降级靠 L1+singleflight+闸门+不排队 |
-| 13 | Redis 全挂，DB 怎么不被打垮？ | 连接池 64 + 闸门 32/进程 + L1 + singleflight；没有熔断、没有全局限流、闸门只覆盖部分入口；抖动无效 |
-| 14 | 旧请求回写覆盖新值？ | 存在：读库→DEL→异步回写旧值；严格修法版本号 + Lua CAS；过渡用延迟双删；结构上拆高频字段；当前未做 |
-| 15 | L1 未失效，跨实例不一致？ | 每个进程一份，没有广播；本项目头像不在 Feed，但 username 是反范式列，改名连 DB 旧行都不更新；方案：短 TTL / Pub/Sub / 版本 / 强一致字段绕开 L1 |
-| 16 | DB 也失败，还零报错？ | 不成立；Redis 故障不返回 5xx 是真的，但实体查库失败会静默丢条（200 少数据），关注流 500/503，冷区 500；简历要限定范围 |
-| 17 | Redis 过期但 L1 未过期，会回源吗？ | 不会，L1 先命中；但 L1 5s 后仍会回源；防不住跨 Pod、整体冷启动、多 key 同时 miss、热榜快照缺失回落 MySQL |
+| 12 | Redis 客户端怎么配？降级怎么不放大？ | 已开 `ContextTimeoutEnabled=true`，50ms 真实生效；池 64/空闲 8/池等待 200ms/读写 1s/重试 1；降级靠 L1+singleflight+统一闸门+不排队；回写有界 256 |
+| 13 | Redis 全挂，DB 怎么不被打垮？ | 连接池 64 + 闸门 `MaxOpenConns/2` + L1 + singleflight；所有 Feed DB 入口已接入；没有熔断、没有全局限流、闸门仍是每进程；抖动无效 |
+| 14 | 旧请求回写覆盖新值？ | 已用「失效版本号 + Lua CAS」：失效原子 INCR+DEL，回写版本不符就丢；版本读不到不回写；关注流列表成员竞态仍在（影响限于页 TTL） |
+| 15 | L1 未失效，跨实例不一致？ | 每个进程一份，没有广播；头像不在 Feed，但 username 是反范式列，改名已在事务内同步 videos 并失效实体；跨实例仍最多脏 5s；方案：短 TTL / Pub/Sub / 强一致字段绕开 L1 |
+| 16 | DB 也失败，还零报错？ | 只对「Redis 故障」成立；MySQL 失败现在整页 500/503，不再 200 短页；唯一静默降级的是 `IsLiked` 辅助字段；简历要限定范围 |
+| 17 | Redis 过期但 L1 未过期，会回源吗？ | 不会，L1 先命中；但 L1 5s 后仍会回源；防不住跨 Pod、整体冷启动、多 key 同时 miss、热榜快照缺失回落 MySQL（已接闸门） |
 
 ---
 
@@ -1267,14 +1284,14 @@ videos, err := f.repo.ListByPopularity(...)   // ← MySQL 兜底，没接 dbLoa
 ```text
 50ms 超时怎么做的？
   → context.WithTimeout(50ms) + MGET
-  → 真的 50ms 吗？不是：ContextTimeoutEnabled=false，socket 读写 3s
-  → 那 Redis 卡住会怎样？每个请求最多卡 3s，goroutine 堆积
-  → 连接池多大？默认 10×GOMAXPROCS，没显式配
-  → 池满了呢？PoolTimeout 4s，然后报错
-  → 降级到 DB 怎么防雪崩？L1 + singleflight + 闸门 32 + 池 64
-  → 闸门是全局的吗？不是，每进程
-  → 覆盖所有 DB 入口吗？不是，冷区/热榜兜底/点赞榜/话题流没有
-  → 那怎么办？统一闸门 + 熔断 + 全局限流 + 指标
+  → 真的 50ms 吗？现在是真的：开了 ContextTimeoutEnabled
+  → 以前呢？默认 false，ctx 不传给 socket，实际受 3s ReadTimeout
+  → 连接池多大？64 / 空闲 8，池等待 200ms，重试 1
+  → 池满了呢？200ms 拿不到连接就报错，回源兜底
+  → 降级到 DB 怎么防雪崩？L1 + singleflight + dbguard + 池 64
+  → 闸门是全局的吗？不是，每进程；容量 = MaxOpenConns/2，随连接池伸缩
+  → 覆盖所有 DB 入口吗？Feed 的入口都接了，GetDetail 也接了
+  → 那还缺什么？熔断 + 全局限流 + 指标
 ```
 
 ## 5.3 Q14 追问链
@@ -1284,23 +1301,24 @@ videos, err := f.repo.ListByPopularity(...)   // ← MySQL 兜底，没接 dbLoa
   → 先 DB 后 DEL（Cache-Aside）
   → 为什么不是先删？删后读 miss 会把旧值填回来
   → 先 DB 后 DEL 就安全吗？不，已经在途的读会在 DEL 之后回写旧值
-  → 你们怎么防？没防，靠 L1 5s 压本地影响
-  → Redis 里脏多久？最长 1h（实体 TTL）
-  → 怎么修？版本号 + Lua CAS
-  → 没有版本号怎么办？延迟双删，但不是严格正确
-  → 更彻底呢？拆高频字段 / 逻辑过期 / 写穿透
+  → 你们怎么防？失效时 INCR version + DEL 原子执行；回写版本 CAS
+  → 版本什么时候读？查库之前；查库后才失效的话 CAS 必须失败
+  → 版本读不到呢？本次不回写，比较基准不可信
+  → 版本 TTL 多久？25h，必须长于实体 1h
+  → 关注流呢？列表只存 ID，内容不脏；列表成员竞态仍在，影响限于页 TTL
+  → 还做吗？拆高频字段（点赞数独立计数器）是命中率优化，不是正确性
 ```
 
 ## 5.4 Q16 追问链
 
 ```text
 你说接口零报错，DB 挂了呢？
-  → 实体路径吞掉错误，200 但少数据
-  → 为什么不报错？为了不让缓存故障变成接口故障
-  → 但这样客户端不知道数据缺失？是的，这是缺陷
-  → 关注流呢？500，闸门满 503
+  → 实体路径返回聚合错误，整页 500；闸门满则 503
+  → 为什么不返回部分数据？短页会被客户端当成「到底了」，热榜还会跳过失败项
+  → 关注流呢？同样 500/503
   → 那「零报错」到底指什么？仅指 Redis 故障不导致 5xx
-  → 怎么改？返回 degraded 标记 / 全失败返回 503 / 指标
+  → 还有静默降级吗？`IsLiked` 查不到时降级 false，因为它只是辅助字段
+  → 怎么继续改？degraded 标记 / missing_ids / 指标
   → 查库失败会写哨兵吗？不会，只有查到 0 条才写，这个边界是对的
 ```
 
@@ -1313,27 +1331,30 @@ videos, err := f.repo.ListByPopularity(...)   // ← MySQL 兜底，没接 dbLoa
 | 旧文档里的说法 | 位置 | 当前事实 |
 |---|---|---|
 | 「缓存穿透没有防护，是已知短板」 | `start-learn/缓存体系.md` §6、`learn/feed模块学习文档.md` §3.5 | **已修**：`__null__` 哨兵 60s，`GetVideoByIDs` 和 `GetDetail` 都接上了 |
-| 「Redis 宕机没有熔断/限流兜底」 | `start-learn/缓存体系.md` §6、`learn/feed模块学习文档.md` §3.5 | **部分修**：连接池 64 + `dbLoadGate` 32；仍然没有熔断，且闸门只覆盖实体和关注流 |
+| 「Redis 宕机没有熔断/限流兜底」 | `start-learn/缓存体系.md` §6、`learn/feed模块学习文档.md` §3.5 | **部分修**：连接池 64 + 统一 `dbguard`（容量随池伸缩，覆盖全部 Feed DB 入口）；仍然没有熔断和全局限流 |
 | 「关注流的 context 超时预算被复用」 | `learn/feed模块学习文档.md` §3.5、`已知问题清单` F4 | **已修**：`getCached` / `setCached` / `Lock` / 读缓存各自新建 ctx |
-| 「热榜 `opCtx` 被 4 步共用」 | `已知问题清单` A1 | **已修**：`ensureHotSnapshot` 用独立预算，分页读取用 `readCtx`（`feed/service.go:769`） |
+| 「热榜 `opCtx` 被 4 步共用」 | `已知问题清单` A1 | **已修**：`ensureHotSnapshot` 用独立预算，分页读取用 `readCtx` |
 | 「热榜快照重建无并发保护」 | `learn/feed模块学习文档.md` §5.5 | **已修**：`ensureHotSnapshot` 用 singleflight 按 `asOf` 去重 + 双重检查；另有后台预生成 `StartHotSnapshotBuilder` |
-| 「50ms 硬超时」 | 多份文档 | **需要限定**：ctx 是 50ms，但 go-redis 默认不把它传给 socket 读写，实际读超时 3s。要开 `ContextTimeoutEnabled` 才是真 50ms |
+| 「50ms 硬超时」 | 多份文档 | **旧代码确实不成立**（默认 `ContextTimeoutEnabled=false`，实际 3s）；**现已修复**，开 true + 1s 读写兜底 |
 | 「L1 TTL 3 秒」 | `start-learn/缓存体系.md` §1.3 | **实际 5 秒**，3 秒只是未使用的默认值 |
-| 旧行号（`service.go:35-110` 等） | `learn/feed模块学习文档.md` §3 | 代码新增了哨兵、闸门、热榜预生成，行号整体后移约 80 行，引用时以当前文件为准 |
+| 「关注流整页缓存脏 24h」 | 旧版本汇总 | **已修**：列表只存 ID+游标，内容每次 hydrate；只有列表成员在深层页可能残留 |
+| 「旧请求回写覆盖新值，未解决」 | 旧版本 Q14 | **已修**：失效版本号 + Lua CAS；版本读不到不回写 |
+| 「改名不更新 videos.username」 | 旧版本 Q15 | **已修**：改名事务内同步 `videos.username`，提交后逐条失效实体缓存 |
+| 「过载响应码不一致（500 vs 503）」 | 旧版本 Q13/Q16 | **已修**：所有 Feed handler 统一走 `apierror.ClassifyHTTPStatus`，过载 503、其他 DB 错误 500 |
+| 旧行号（`service.go:35-110` 等） | `learn/feed模块学习文档.md` §3 | 代码新增了哨兵、闸门、版本 CAS、列表缓存改造，行号整体后移，引用时以当前文件为准 |
 
 **仍然成立的短板（可以继续讲）**
 
 | 短板 | 位置 | 影响 |
 |---|---|---|
-| `singleflight.Do` 不接收 ctx | `feed/service.go:203,275,325,372,707` | leader 卡死时 follower 永久阻塞；客户端断开也无法退出 |
-| 关注流整页缓存含完整元数据，视频变更不失效 | `feed/service.go:558-583` | 改标题 / 删视频 / 点赞数变化，最长脏 24h |
-| 冷启动按 ID 单查 | `feed/service.go:197-248` | 一页 20 个冷 ID → 20 条单行 SQL |
-| 关注流等锁固定 5×20ms | `feed/service.go:619-628` | 高负载下大量请求最终仍落到 DB |
-| 异步回写错误被忽略 | `feed/service.go:229-234` | 缓存写失败无感知，DB 持续承压 |
-| 无界异步回写 goroutine | `feed/service.go:229` | Redis 故障时 goroutine 堆积 |
-| 热榜 MySQL 兜底无闸门 | `feed/service.go:838` | 快照缺失时首页直接打 DB |
-| 过载响应码不一致 | `feed/handler.go:47,142` | 关注流 503，最新流/热榜 500 |
-| `maxConcurrentDBLoad` 不随连接池配置变化 | `feed/service.go:68` | 调大池子但闸门仍是 32 |
+| `singleflight.Do` 不接收 ctx | `feed/service.go` 实体回源 | leader 卡死时 follower 永久阻塞；客户端断开也无法退出 |
+| 冷启动按 ID 单查 | `feed/service.go` `GetVideoByIDs` | 一页 20 个冷 ID → 20 条单行 SQL |
+| 关注流等锁固定 5×20ms | `feed/service.go` `ListByFollowing` | 高负载下大量请求最终仍落到 DB |
+| 异步回写失败只打日志 / 满了丢弃 | `video/video_cache.go` | 无感知，但不影响正确性，下一次 miss 会再补 |
+| 关注流列表成员竞态 | `feed/service.go` `setCached` | 并发取关时，在途写回可能让该页残留旧 ID；内容仍会 hydrate 过滤 |
+| L1 没有跨实例失效 | `feed/service.go` 本地缓存 | 其他实例最多脏 5s；改名/点赞在 5s 后一致 |
+| 无熔断 / 无全局限流 / 无指标 | `dbguard` 之外 | 持续故障时每个请求仍要等超时；闸门拒绝量不可观测 |
+| 部分失败导致整页 5xx | `GetVideoByIDs` | 不返回残缺页，但客户端也拿不到已成功的部分；可用 `degraded` 标记改进 |
 
 ---
 
@@ -1362,11 +1383,13 @@ videos, err := f.repo.ListByPopularity(...)   // ← MySQL 兜底，没接 dbLoa
 
 ```text
 L1：5s（默认 3s 未生效）/ janitor 5s
-实体：1h          哨兵：60s
-关注流整页：24h
-单次 Redis ctx：50ms（真实 IO 上限约 3s，需开 ContextTimeoutEnabled）
+实体：1h          哨兵：60s        版本号：25h
+关注流：首页 30s / 深层 24h（只存 ID）
+单次 Redis ctx：50ms（已开 ContextTimeoutEnabled）
+Redis 兜底读写：1s   池：64 / 8 / 等待 200ms / 重试 1
 关注流锁：500ms   等锁：5 × 20ms
 MySQL 池：64 / 16 / 1h
-回源闸门：32 / 进程（非阻塞）
+回源闸门：MaxOpenConns/2 = 32 / 进程（非阻塞）
+异步回写：256 槽位（满了丢弃）
 热榜：窗口 60 分钟 / 桶 TTL 2h / 快照 2min / Top 5000 / 合并 500ms
 ```

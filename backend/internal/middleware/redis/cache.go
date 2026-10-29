@@ -87,16 +87,72 @@ func (c *Client) PExpire(ctx context.Context, key string, ttl time.Duration) err
 	return c.rdb.PExpire(ctx, key, ttl).Err()
 }
 
+// setBitWithTTLScript 把置位和续期合成一次原子操作。
+// pipeline 只是批量发送，不是原子执行：SETBIT 成功而 PEXPIRE 失败仍会留下永不过期的 key。
+var setBitWithTTLScript = redis.NewScript(`
+redis.call("SETBIT", KEYS[1], ARGV[1], ARGV[2])
+redis.call("PEXPIRE", KEYS[1], ARGV[3])
+return 1
+`)
+
 // SetBitWithTTL 置位并刷新 TTL，一次往返完成，避免「置位成功但 PEXPIRE 失败」留下永不过期的 key。
 func (c *Client) SetBitWithTTL(ctx context.Context, key string, offset int64, value int, ttl time.Duration) error {
 	if c == nil || c.rdb == nil {
 		return errors.New("redis client not initialized")
 	}
+	return setBitWithTTLScript.Run(
+		ctx, c.rdb, []string{key}, offset, value, ttl.Milliseconds(),
+	).Err()
+}
+
+// PExpireMany 用一个 pipeline 给一组 key 续期。
+// 分片上传的会话、位图、hash 索引必须一起续：只续其中一部分会让三者寿命错位。
+func (c *Client) PExpireMany(ctx context.Context, ttl time.Duration, keys ...string) error {
+	if c == nil || c.rdb == nil {
+		return nil
+	}
+	if len(keys) == 0 {
+		return nil
+	}
 	pipe := c.rdb.Pipeline()
-	pipe.SetBit(ctx, key, offset, value)
-	pipe.PExpire(ctx, key, ttl)
+	for _, key := range keys {
+		pipe.PExpire(ctx, key, ttl)
+	}
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+func (c *Client) Exists(ctx context.Context, key string) (bool, error) {
+	if c == nil || c.rdb == nil {
+		return false, errors.New("redis client not initialized")
+	}
+	n, err := c.rdb.Exists(ctx, key).Result()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// compareAndDeleteScript 只在值仍等于期望值时才删除。
+// 用于「映射仍指向我这个会话」的清理：并发 re-init 可能已经把它改指向新会话，
+// 无条件 DEL 会把别人的映射删掉。
+var compareAndDeleteScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+else
+  return 0
+end
+`)
+
+func (c *Client) CompareAndDelete(ctx context.Context, key string, expected []byte) (bool, error) {
+	if c == nil || c.rdb == nil {
+		return false, nil
+	}
+	n, err := compareAndDeleteScript.Run(ctx, c.rdb, []string{key}, string(expected)).Int64()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 func (c *Client) GetBit(ctx context.Context, key string, offset int64) (int64, error) {

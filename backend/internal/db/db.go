@@ -3,6 +3,7 @@ package db
 import (
 	"feedsystem_video_go/internal/account"
 	"feedsystem_video_go/internal/config"
+	"feedsystem_video_go/internal/dbguard"
 	"feedsystem_video_go/internal/message"
 	"feedsystem_video_go/internal/social"
 	"feedsystem_video_go/internal/video"
@@ -37,6 +38,10 @@ func NewDB(dbcfg config.DatabaseConfig) (*gorm.DB, error) {
 	sqlDB.SetMaxIdleConns(dbcfg.MaxIdleConns)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
+	// 回源闸门容量必须跟着连接池走：写死常量时，调大 MYSQL_MAX_OPEN_CONNS
+	// 只会放大连接池，闸门仍是旧值，两边就脱节了。
+	dbguard.Configure(dbcfg.MaxOpenConns)
+
 	return db, nil
 }
 
@@ -44,8 +49,16 @@ func AutoMigrate(db *gorm.DB) error {
 	return db.AutoMigrate(
 		&account.Account{}, &video.Video{}, &video.Like{}, &video.Comment{},
 		&social.Social{}, &video.OutboxMsg{}, &video.Tag{}, &video.VideoTag{},
-		&message.Message{}, &worker.Notification{},
+		&message.Message{}, &worker.Notification{}, &worker.DeadLetter{},
+		&video.LikeEventLog{},
 	)
+}
+
+// AutoMigrateWorker 只迁移 Worker 进程自己需要的表。
+// Worker 进程不跑完整的 AutoMigrate（那是 API 启动时的职责），但它会写
+// like_events 和 dead_letters，必须在开始消费前保证这两张表存在。
+func AutoMigrateWorker(db *gorm.DB) error {
+	return db.AutoMigrate(&video.LikeEventLog{}, &worker.DeadLetter{})
 }
 
 func CloseDB(db *gorm.DB) error {

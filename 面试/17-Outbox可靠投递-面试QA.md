@@ -1,4 +1,8 @@
-# Outbox 面试问题汇总（19 问）
+# 17 · Outbox 可靠投递（面试 Q&A，19 问）
+
+> 配套专题：`03-事件驱动异步化与最终一致性-专题.md`
+> 全局索引与代码锚点总表：`00-索引-面试文档地图.md`
+> **行号基准：2026-10-27**
 
 > 题源：`chatgpt的面试问题设计.md` 第三节「Outbox 可靠投递」
 > 对应实现：`backend/internal/video/`、`backend/internal/worker/outboxworker.go`、`backend/internal/middleware/rabbitmq/`
@@ -14,8 +18,8 @@
 MySQL 事务（videos + outbox_msgs 同一 tx）
    → poller 每秒 ListDue 100 条
    → Claim：CAS pending→processing + fencing token
-   → Publish：persistent 消息 + publisher confirm（5s）
-   → MarkSent / MarkRetry（指数退避）/ MarkFailed
+   → Publish：persistent 消息 + PublishWithDeferredConfirm（按 DeliveryTag 确认，5s 超时）
+   → MarkSent / MarkDeferred（broker 级故障，5s 后重试）/ MarkRetry（指数退避+抖动）/ MarkFailed
    → RabbitMQ 主队列（手动 ACK，QoS=10）
    → Consumer 三级容错（进程内退避 → 重试队列 TTL → 死信队列）
    → ZADD feed:global_timeline（member=video_id，score=create_time 毫秒）
@@ -32,15 +36,17 @@ MySQL 事务（videos + outbox_msgs 同一 tx）
 
 | 参数 | 值 | 位置 |
 |---|---|---|
-| 轮询间隔 / 单批条数 | 1s / 100 条 | `worker/outboxworker.go:19-20` |
-| 抢占租约（processing 超时） | 60s | `video/video_entity.go:62` |
-| 回收扫描间隔 / 单批上限 | 30s / 1000 条 | `worker/outboxworker.go:21`、`video/outbox_repo.go:14` |
-| 最大重试次数 | 5 次（首次 + 5 次重试 = 6 次投递尝试） | `video/video_entity.go:58` |
-| 退避 | 2s × 2^(n-1)：2/4/8/16/32s，累计约 62s | `video/video_entity.go:60,68` |
-| publisher confirm 超时 | 5s | `middleware/rabbitmq/timelineMQ.go:30` |
-| 单条发布 ctx 超时 | 10s | `worker/outboxworker.go:123` |
-| sent 保留 / 清理间隔 | 24h / 10min | `video/video_entity.go:64`、`worker/outboxworker.go:22` |
-| 消费端本地重试 / 重试队列轮数 | 1+3 次 / 3 轮，TTL 30s | `worker/retry.go:18`、`middleware/rabbitmq/retry.go:17` |
+| 轮询间隔 / 单批条数 | 1s / 100 条 | `worker/outboxworker.go:20-21` |
+| 抢占租约（processing 超时） | 60s | `video/video_entity.go:65` |
+| 回收扫描间隔 / 单批上限 | 30s / 1000 条 | `worker/outboxworker.go:22`、`video/outbox_repo.go:14` |
+| 最大重试次数 | 5 次（首次 + 5 次重试 = 6 次投递尝试） | `video/video_entity.go:61` |
+| 退避 | 2s × 2^(n-1)，**±30% 抖动**：1.4~2.6 / 2.8~5.2 / 5.6~10.4 / 11.2~20.8 / 22.4~41.6s | `video/video_entity.go:63,77-91` |
+| broker 级故障重试间隔 | 5s（**不消耗重试额度**） | `video/video_entity.go:71`、`video/outbox_repo.go:128-140` |
+| publisher confirm 超时 | 5s | `middleware/rabbitmq/timelineMQ.go:40` |
+| 单条发布 ctx 超时 | 10s | `worker/outboxworker.go:139` |
+| sent 保留 / 清理间隔 / 单批删除 | 24h / 10min / 1000 条 | `video/video_entity.go:67`、`worker/outboxworker.go:23`、`video/outbox_repo.go:18` |
+| 状态统计间隔 / pending 告警阈值 | 1min / 5min | `worker/outboxworker.go:25-26` |
+| 消费端本地重试 / 重试队列轮数 | 默认 1+3 次（时间线消费者 1+1 次）/ 3 轮，TTL 30s | `worker/retry.go:20`、`worker/outboxworker.go:256`、`middleware/rabbitmq/dlx.go:11` |
 
 **代码地图：**
 
@@ -48,10 +54,11 @@ MySQL 事务（videos + outbox_msgs 同一 tx）
 |---|---|
 | `video/video_service.go:48-83` | 业务数据 + Outbox 同事务写入，事务内生成 `event_id` |
 | `video/video_entity.go` | 表结构、状态常量、退避函数 |
-| `video/outbox_repo.go` | ListDue / Claim / MarkSent / MarkRetry / MarkFailed / ReapStuck / PurgeSent |
-| `worker/outboxworker.go` | poller（投递）+ timeline consumer（写 ZSET） |
-| `middleware/rabbitmq/timelineMQ.go` | 发布封装 + publisher confirm |
-| `worker/retry.go` | 消费端统一容错骨架（三级重试） |
+| `video/outbox_repo.go` | ListDue / Claim / MarkSent / MarkDeferred / MarkRetry / MarkFailed / ReapStuck / PurgeSent / Stats / ListFailed / ReplayFailed |
+| `worker/outboxworker.go` | poller（投递）+ 周期告警 + timeline consumer（写 ZSET） |
+| `middleware/rabbitmq/timelineMQ.go` | 发布封装 + `PublishWithDeferredConfirm` 精确 confirm |
+| `worker/retry.go` | 消费端统一容错骨架（三级重试，可配置本地重试次数） |
+| `http/outbox_admin.go` | failed 查询/重放、状态快照的运维接口（`X-Admin-Token`） |
 
 ---
 
@@ -131,7 +138,7 @@ COMMIT;
 
 **一句话：** 至少要有「业务引用 + 事件类型 + 状态 + 重试元数据 + 幂等键 + 抢占令牌」，本项目还刻意**不存 payload**。
 
-**本项目的真实结构（`video/video_entity.go:79-105`）：**
+**本项目的真实结构（`video/video_entity.go:93-123`）：**
 
 | 字段 | 作用 | 设计要点 |
 |---|---|---|
@@ -146,8 +153,9 @@ COMMIT;
 | `sent_at` | 确认时间 | `PurgeSent` 按它清理 24 小时前的记录 |
 | `event_id` | **稳定幂等键** | 唯一索引 `idx_outbox_event_id`；在写 outbox 的同一事务里生成，重投不换 ID |
 | `claim_token` | **fencing 令牌** | 每次抢占随机生成；所有状态迁移都带 `WHERE claim_token=?`，防止旧持有者误改新持有者的状态 |
+| `last_error` | **最近一次失败原因** | `MarkRetry/MarkDeferred/MarkFailed/ReapStuck` 都写入（截断到 500 rune）；`MarkSent` 和人工重放时清空。没有它，`failed` 行只能看到「失败了」，看不到「为什么失败」 |
 
-**为什么没有 `payload` 列？** 这条消息的事件体是「引用型」的：`{event_id, video_id, create_time}`，由 poller 在发送时用行里的字段现场构造（`outboxworker.go:117-124`）。消费端也只需要 `video_id + create_time` 就能写 ZSET。详见第 17 问。
+**为什么没有 `payload` 列？** 这条消息的事件体是「引用型」的：`{event_id, video_id, create_time}`，由 poller 在发送时用行里的字段现场构造（`outboxworker.go:133-140`）。消费端也只需要 `video_id + create_time` 就能写 ZSET。详见第 17 问。
 
 **通用化时怎么加：** 如果事件体复杂（比如通知文案、审计快照），就加 `payload JSON`；如果事件需要按聚合根排序，再加 `aggregate_id / version`。
 
@@ -174,12 +182,13 @@ COMMIT;
 | 回答的问题 | broker 是否收下并（对持久化消息）落盘 | 消费者是否处理成功、能否删除这条投递 |
 | 触发时机 | `Publish` 写入 socket 之后异步回执 | 业务处理完成后手动 Ack |
 | 失败表现 | NACK / 超时 / 通道关闭 | Nack(requeue) 重投 / Nack(false) 进死信 |
-| 本项目位置 | `timelineMQ.go:57-66,116-137` | `worker/retry.go:46`（`autoAck=false`）+ `handle` |
+| 本项目位置 | `timelineMQ.go:58-77,119-153` | `worker/retry.go:59`（`autoAck=false`）+ `handle` |
 
 **必须讲清的两个细节：**
 
-1. **`Publish` 返回 nil 只代表写进了本地 socket**，不代表 broker 收到。所以 `PublishJSON` 成功之后还要等 `waitConfirm`，收到 `Ack=true` 才能 `MarkSent`。
+1. **`Publish` 返回 nil 只代表写进了本地 socket**，不代表 broker 收到。本项目用 `PublishWithDeferredConfirm` 拿到**这条消息专属**的 `DeferredConfirmation`，再 `WaitContext`（5s）等 `Ack=true`，才 `MarkSent`。按 `DeliveryTag` 精确等待，不会出现「下一条消息的 ack 被当前消息误用」的错位。
 2. **Confirm ACK 不等于「路由成功」**：如果消息没有匹配到任何队列（绑定缺失），在 `mandatory=false` 时 broker 会丢弃它但仍然回 ACK。所以发布端必须确保拓扑已声明（本项目 `DeclareTimelineTopic` 在 `NewTimelineMQ` 里做），需要更强保证时加 `mandatory=true` + `NotifyReturn`。
+3. **NACK 要分两种**：channel 已关闭时库会把所有未决确认置为 NACK，这是基础设施故障（`ErrBrokerUnavailable`，不烧重试额度）；channel 仍存活时的 NACK 才是 broker 明确拒收（`ErrPublishRejected`，消耗重试额度）。见第 14 问。
 
 **持久化的三个条件：** durable exchange + durable queue + `DeliveryMode=Persistent`。本项目三者都满足（`rabbitMQ.go:117-122`）。缺一个，broker 重启后消息仍可能丢。
 
@@ -267,7 +276,7 @@ for _, m := range rows {
 
 两个实例在同一时刻查到同一批 `pending`，各自都认为「这批归我」，于是**每条消息稳定投递 N 次**（N = 实例数）。这不是小概率竞态，是必然发生。
 
-**正确写法（`video/outbox_repo.go:59-78`）：**
+**正确写法（`video/outbox_repo.go:83-102`）：**
 
 ```go
 tx := r.db.Model(&OutboxMsg{}).
@@ -305,7 +314,7 @@ if tx.RowsAffected != 1 {
 
 **一句话：** `claimed_at` 就是租约；60s 未落地由 `ReapStuck` 放回 `pending`，并清 token、消耗一次重试额度；旧持有者靠 fencing token 无法再改状态。
 
-**机制（`video/outbox_repo.go:140-189`）：**
+**机制（`video/outbox_repo.go:181-232`）：**
 
 ```
 每 30s 扫描一次（启动后第一轮立刻扫）：
@@ -345,19 +354,19 @@ T61   B: 投递成功，MarkSent(id=7, tok2) → 1 行 → sent
 
 ## 9. 你如何判断一条 Outbox 消息已经发送成功？收到 Confirm ACK 后更新状态，但更新数据库失败怎么办？
 
-**一句话：** 成功的判据是 `waitConfirm` 收到 `Ack=true`；如果此时 DB 更新失败，消息可能已经进了 broker，本地行会在 60s 后被回收并**再发一次**——选择「重复」而不是「丢失」。
+**一句话：** 成功的判据是「本条消息的 `DeferredConfirmation` 收到 `Ack=true`」；如果此时 DB 更新失败，消息可能已经进了 broker，本地行会在 60s 后被回收并**再发一次**——选择「重复」而不是「丢失」。
 
 **判据链条：**
 
 ```
-PublishWithContext 返回 nil        ← 只代表写进 socket，不代表 broker 收到
+PublishWithDeferredConfirm 返回 nil  ← 只代表写进 socket，不代表 broker 收到
   ↓ 还不够
-waitConfirm 收到 Ack=true          ← broker 已接受并（持久化消息）落盘
+dc.WaitContext 返回 Ack=true（5s）    ← broker 已接受并（持久化消息）落盘
   ↓ 才算成功
-MarkSent → RowsAffected=1          ← 状态落地
+MarkSent → RowsAffected=1            ← 状态落地
 ```
 
-三者缺一不可。只看第一个就是原实现的 bug：`PublishJSON` 返回 nil 就 `Delete` 本地行，broker 重启后消息永久丢失。
+三者缺一不可。只看第一个就是旧实现的 bug：publish 返回 nil 就 `Delete` 本地行，broker 重启后消息永久丢失。
 
 **MarkSent 失败的三种情况：**
 
@@ -371,7 +380,7 @@ MarkSent → RowsAffected=1          ← 状态落地
 
 **为什么不在这里做「发送成功后删除本地行」？** 删除会让「是否发过」失去查询依据，也无法做审计、重放和积压观测。本项目用 `sent` + 24h 后 `PurgeSent`。
 
-**加分：** 如果 DB 长时间不可用，`processing` 行会不断被回收、重发，broker 里会出现重复消息，消费端压力上升。这是「宁可重复」的代价；生产上应对 `processing` 数量和回收次数做告警。
+**加分：** 如果 DB 长时间不可用，`processing` 行会不断被回收、重发，broker 里会出现重复消息，消费端压力上升。这是「宁可重复」的代价。本项目现在每分钟统计一次 `processing / stuck / failed / 最老 pending`，`stuck > 0` 会打 `[ALERT]`，同时写成 `/metrics` 的 gauge（`feedsystem_outbox_messages{status="stuck"}`）。
 
 ---
 
@@ -399,8 +408,8 @@ ZAdd(key, redis.Z{Score: create_time_ms, Member: video_id})
 
 **必须同时满足的前提：**
 
-1. **幂等键稳定**：`event_id` 在写 outbox 的同一事务里生成并落库（`video_service.go:56-65`），poller 重投时从行里读出来原样带上（`outboxworker.go:117-124`）。改前是在 `PublishVideo` 里每次新生成，同一条消息两次投递带不同 ID，消费端根本没法去重——这是修过的真实缺陷。
-2. **幂等下沉到存储**：`ZADD` 覆盖语义天然幂等；不要先 `SETNX` 占位再写 ZSET——占位成功但写失败会让后续重试全被挡住，**去重反而制造丢数据**（`outboxworker.go:263-275` 有完整论证）。
+1. **幂等键稳定**：`event_id` 在写 outbox 的同一事务里生成并落库（`video_service.go:56-65`），poller 重投时从行里读出来原样带上（`outboxworker.go:133-137`）。改前是在 `PublishVideo` 里每次新生成，同一条消息两次投递带不同 ID，消费端根本没法去重——这是修过的真实缺陷。
+2. **幂等下沉到存储**：`ZADD` 覆盖语义天然幂等；不要先 `SETNX` 占位再写 ZSET——占位成功但写失败会让后续重试全被挡住，**去重反而制造丢数据**（`outboxworker.go:300-309` 有完整论证）。
 
 **如果副作用不是幂等的（计数累加、发通知）怎么办？**
 
@@ -423,62 +432,65 @@ ZAdd(key, redis.Z{Score: create_time_ms, Member: video_id})
 
 ## 11. 你使用什么策略退避重试？固定间隔、指数退避还是指数退避加随机抖动？如何设置最大重试次数？
 
-**一句话：** 发布端用**纯指数退避**（2s 起、5 次、累计约 62s 转 `failed`）；消费端是**指数退避 + 抖动**，并外加 TTL 重试队列和死信队列。发布端目前没有 jitter，这是已知缺口。
+**一句话：** 发布端用**指数退避 + ±30% 抖动**（2s 起、5 次、名义累计约 62s 转 `failed`），同时把 broker/连接级故障单独分流成 `MarkDeferred`（5s 后重试、**不烧重试额度**）；消费端也是指数退避 + 抖动，并外加 TTL 重试队列和死信队列。
 
-**发布端（Outbox，`video/video_entity.go:56-77`）：**
+**发布端（Outbox，`video/video_entity.go:77-91`）：**
 
 ```
-第 n 次重试等待 2s × 2^(n-1)：
-  2s → 4s → 8s → 16s → 32s   （n=1..5）
-累计约 62s；第 5 次失败后 RetryCount=5，
+第 n 次重试等待 2s × 2^(n-1)，再叠加 ±30% 抖动：
+  名义值：  2s → 4s → 8s → 16s → 32s       （n=1..5）
+  实际区间：1.4~2.6 / 2.8~5.2 / 5.6~10.4 / 11.2~20.8 / 22.4~41.6s
+名义累计约 62s；第 5 次失败后 RetryCount=5，
 下一次失败判断 5+1 > 5 → failed
 ```
 
 - **为什么指数**：瞬时故障（连接抖动、锁等待）几秒内自愈；持久故障（broker 宕机）下固定 1s 重试等于持续打靶，日志和 DB 都被打爆；
 - **为什么封顶 5 次**：既要给 broker 恢复留时间，又不能让一条消息无限期占着 `pending`；超过后转 `failed`，让问题**可见**、可人工介入；
-- **`next_retry_at` 的作用**：失败消息在退避期内对 `ListDue` 不可见，防止「每秒重试 100 条」的空转风暴。
+- **`next_retry_at` 的作用**：失败消息在退避期内对 `ListDue` 不可见，防止「每秒重试 100 条」的空转风暴；
+- **为什么加 ±30% 抖动**：多实例部署时各实例的退避相位会逐渐趋同，broker 恢复的瞬间它们会同时重试，形成二次尖峰。±30% 足以打散相位，又不会破坏「次数越多等越久」的性质（相邻区间不重叠）；
+- **broker 级故障不走这条路径**：`ErrBrokerUnavailable`（channel 关闭、I/O 失败、confirm 超时）调用 `MarkDeferred`，5s 后重新可见且 `retry_count` 不变。否则「MQ 停机 2 分钟」就足以把积压消息全烧成 `failed`。只有 `ErrPublishRejected`（broker 明确 NACK）和消息级错误才消耗额度。
 
 **消费端（`worker/retry.go`）三级：**
 
 | 级别 | 参数 | 失败后 |
 |---|---|---|
-| 进程内重试 | 1 + 3 次，0.5~1s / 1~2s / 2~4s（带 jitter，封顶 8s） | 投重试队列 |
+| 进程内重试 | 默认 1 + 3 次，0.5~1s / 1~2s / 2~4s（带 jitter，封顶 8s） | 投重试队列 |
 | 重试队列 | TTL 30s 后自动回主队列，最多 3 轮（`MaxRetryCount=3`） | 进死信 |
-| 死信队列 | `<queue>.dlx`，只告警不自动重放 | 人工处理 |
+| 死信队列 | `<queue>.dlx`，落表 + 告警，不自动重放 | 人工处理 |
 
-**消费端为什么要 jitter：** 一批消息同时失败（比如 Redis 瞬断），如果退避时间相同，恢复瞬间会集体重试形成尖峰，把下游再打一次。`retry.go:119-126` 用 `wait/2 + rand(wait/2)` 把重试打散。
+**时间线消费者的特殊配置：** 它跑在 QoS=10 的单条流上，进程内 `sleep` 重试会阻塞整条流，所以 `MaxLocalRetries=1`（1+1 次），其余尽快交给 TTL 重试队列（`outboxworker.go:250-256`）。消费骨架的本地重试次数因此是可配置的，而不是写死 3。
 
-**发布端为什么没 jitter：** 单实例串行 poller，天然不会出现「同一秒 100 条同时重试」的尖峰。但多实例部署时，各实例的退避相位会趋同，仍建议加 ±30% 抖动——这是本模块的已知待改进项之一。
+**消费端为什么要 jitter：** 一批消息同时失败（比如 Redis 瞬断），如果退避时间相同，恢复瞬间会集体重试形成尖峰，把下游再打一次。`retry.go:158-166` 用 `wait/2 + rand(wait/2)` 把重试打散。
 
 **重试次数怎么定：**
 
 - 由「可容忍的故障恢复时间」和「告警响应时间」共同决定：62s 覆盖常见 broker 抖动，超过 62s 还没好就应该有人看；
-- 区分**可重试错误**（网络、超时、NACK、5xx）和**不可重试错误**（消息体非法、路由不存在）。后者重试多少次都没用，应该直接进 `failed`/DLQ，而不是烧完额度；
+- 区分**基础设施故障**（网络、超时、channel 关闭）和**消息级失败**（broker NACK、消息体非法）。前者不烧额度、等恢复；后者才消耗额度。本项目已实现这一层分类；更细的「不可重试错误直接进 `failed`」还没做——例如路由不存在时 broker 会在 `mandatory=false` 下静默 ACK，要靠 `mandatory=true + NotifyReturn` 才能发现；
 - 最大次数是配置常量（`OutboxMaxRetries`），不是散落的魔法数字。
 
 ---
 
 ## 12. 多个 Worker 抢占任务时，如何避免长时间锁表、重复扫描和大量无效轮询？
 
-**一句话：** 不在事务里做网络 I/O（CAS 只锁一条 UPDATE）；`ListDue` 只读不占；单批 100 条；`next_retry_at` 让失败消息退避；失败后立刻重建 channel 并跳出本批。
+**一句话：** 不在事务里做网络 I/O（CAS 只锁一条 UPDATE）；`ListDue` 只读不占；单批 100 条；`next_retry_at` 让失败消息退避；**broker 级失败**才重建 channel 并跳出本批，消息级失败继续处理本批。
 
 **逐项对应：**
 
 | 问题 | 本项目的做法 | 位置 |
 |---|---|---|
-| 长时间锁表 | 不用 `FOR UPDATE` 包住 publish；只做单行 `UPDATE`，临界区是毫秒级 | `outbox_repo.go:59-78` |
-| 重复扫描 | `ListDue` 只查不占，`Claim` 决定归属；`RowsAffected=0` 直接跳过 | `outbox_repo.go:42-50,74-76` |
-| 无效轮询 | 1s 间隔；`next_retry_at` 退避；一次最多 100 条 | `outboxworker.go:19-20,93` |
-| 坏连接放大失败 | 一条发布失败后 `Close()` 并置 `tmq=nil`，`break` 跳出本批，下一轮重建 | `outboxworker.go:158-162` |
+| 长时间锁表 | 不用 `FOR UPDATE` 包住 publish；只做单行 `UPDATE`，临界区是毫秒级 | `outbox_repo.go:50-56,83-102` |
+| 重复扫描 | `ListDue` 只查不占，`Claim` 决定归属；`RowsAffected=0` 直接跳过 | `outbox_repo.go:66-74,83-102` |
+| 无效轮询 | 1s 间隔；`next_retry_at` 退避；一次最多 100 条 | `outboxworker.go:20-21,109` |
+| 坏连接放大失败 | **仅 broker 级故障**才 `Close()` + `tmq=nil` + `break` 重建；消息级失败只 NACK 当前条，继续处理本批 | `outboxworker.go:158-193` |
 | 多实例空转 | 每个实例 1 QPS 空 SELECT，走 `status` 索引，代价微秒级 | — |
-| 表膨胀影响扫描 | `PurgeSent` 每 10min 清 24h 前的 `sent` | `outboxworker.go:84-91` |
+| 表膨胀影响扫描 | `PurgeSent` 每 10min **分批**清 24h 前的 `sent`（1000 条/批，避免长事务） | `outboxworker.go:88-95`、`outbox_repo.go:237-257` |
 
 **空轮询到底贵不贵？** 单实例每秒一次空 SELECT 几乎无感。真正的成本是：
 
 1. **每条消息 3 次 DB 往返**：`Claim` → 发 MQ → `MarkSent`；100 条 = 200 次 UPDATE；
 2. **多实例线性放大**：N 个 API 实例就是 N 倍空轮询，99% 空转；
 3. **索引失效**：`next_retry_at IS NULL OR next_retry_at <= ?` 的 `OR + NULL` 很难走范围扫描，退避消息多时要逐行过滤才凑够 100 条；
-4. **`failed` 堆积**拖慢扫描。
+4. **`failed` 堆积**拖慢扫描——所以 `failed > 0` 现在会每分钟打 `[ALERT]`，并可通过 `/admin/outbox/failed` 查看、`/admin/outbox/replay` 重放，不让它无限期堆着。
 
 **优化路线（按 ROI 排序）：**
 
@@ -503,7 +515,7 @@ ZAdd(key, redis.Z{Score: create_time_ms, Member: video_id})
 
 | 现象 | 判断 | 处置 |
 |---|---|---|
-| `outbox_msgs` 里 `pending` 持续增长，但 broker 队列深度平稳 | 发布端问题：poller 没跑、channel 反复重建、confirm 超时 | 看 poller 日志、`retry_count` 分布、网络/MQ 连接状态 |
+| `outbox_msgs` 里 `pending` 持续增长，但 broker 队列深度平稳 | 发布端问题：poller 没跑、channel 反复重建、confirm 超时 | 看 `[ALERT]` 日志、`/admin/outbox/stats`、`retry_count` 分布、网络/MQ 连接状态 |
 | broker `ready` 持续增长，消费 ACK 速率 < 发布速率 | 消费者跟不上：DB 慢、Redis 慢、handler 阻塞、QoS 太小/太大 | 扩消费者、查慢 SQL、查下游 RT、调 QoS |
 | 发布速率和投递速率同时掉到 0，broker 有内存/磁盘告警、连接 blocked | broker 自身故障或限流 | 先救 broker（磁盘、内存、流控） |
 | 发布速率本身突然升高（活动、刷量） | 真实流量突增 | 扩容消费者 + 生产者限流 |
@@ -518,6 +530,13 @@ ZAdd(key, redis.Z{Score: create_time_ms, Member: video_id})
 - `COUNT(*) WHERE status='processing' AND claimed_at < now()-60s`：卡死量；
 - `COUNT(*) WHERE status='failed'`：终态失败，>0 就该告警；
 - `MAX(retry_count)`：接近 5 说明即将转 failed。
+
+**本项目已落地的观测（不是纸面设计）：**
+
+- `OutboxRepository.Stats` 用一条条件聚合 SQL 把这五项一次查出来（`outbox_repo.go:261-274`）；
+- poller 每 1 分钟调用一次，写成 gauge：`feedsystem_outbox_messages{status="pending|processing|failed|stuck"}`、`feedsystem_outbox_oldest_pending_seconds`（`outboxworker.go:99-107,336-347`）；
+- `failed > 0`、`stuck > 0`、最老 pending 超过 5 分钟，分别打 `[ALERT]` 日志，供日志采集直接告警（`outboxworker.go:358-370`）；
+- `GET /admin/outbox/stats` 可实时取同一份快照（需 `X-Admin-Token`）。
 
 **RabbitMQ**
 
@@ -541,9 +560,9 @@ ZAdd(key, redis.Z{Score: create_time_ms, Member: video_id})
 
 ## 14. MySQL 事务提交成功，但 RabbitMQ 持续不可用 2 小时，消息会发生什么？恢复后如何补发？
 
-**一句话：** 消息安全留在 `outbox_msgs` 的 `pending` 里，poller 每 5s 尝试重建连接、不退出；MQ 恢复后自动补发，**不需要重启进程**。但「整机不可用」和「半死不活」要分开说，后者会烧重试额度。
+**一句话：** 消息安全留在 `outbox_msgs` 的 `pending` 里，poller 每 5s 尝试重建连接、不退出；MQ 恢复后自动补发，**不需要重启进程**。连接级故障和消息级失败已经分流：前者不烧重试额度，后者的终态失败可查、可重放。
 
-**完整行为（`worker/outboxworker.go:59-69`）：**
+**完整行为（`worker/outboxworker.go:63-73`）：**
 
 ```
 tmq == nil
@@ -559,18 +578,21 @@ tmq == nil
 
 这正是修复前的问题：旧代码启动时 `tmq == nil` 就 `return`，之后即使 MQ 恢复也永远不投递，只能重启 API。修成循环内重建后，才是真正的「降级不丢数据」。
 
-**但要诚实区分两种「不可用」：**
+**现在的错误分类（`rabbitmq/timelineMQ.go:13-20`、`worker/outboxworker.go:161-192`）：**
 
-| 故障形态 | 行为 | 风险 |
-|---|---|---|
-| 连接建立失败（broker 进程挂了/端口不通） | `NewTimelineMQ` 失败，不 Claim、不烧额度 | 安全，恢复即补发 |
-| 连接在、但 publish NACK / confirm 5s 超时（磁盘告警、流控、网络黑洞） | 每条失败 → `MarkRetry`，5 次后转 `failed` | **约 62s 就会把消息打成终态**，恢复后不会自动重发 |
+| 故障形态 | 分类 | 行为 | 风险 |
+|---|---|---|---|
+| 连接建立失败（broker 进程挂了/端口不通） | `tmq == nil` | `NewTimelineMQ` 失败，不 Claim、不烧额度 | 安全，恢复即补发 |
+| publish I/O 失败 / confirm 5s 超时 / channel 关闭 | `ErrBrokerUnavailable` | `MarkDeferred`：5s 后重新可见，**`retry_count` 不变**；关闭并重建 channel，`break` 本批 | 安全，恢复即补发 |
+| broker 明确 NACK（消息级拒收） | `ErrPublishRejected` | `MarkRetry`（指数退避+抖动），5 次后转 `failed` | 约 62s 终态，需人工重放 |
+| 交换机/队列被误删（broker 关闭 channel，表现为 404） | `ErrBrokerUnavailable` | 持续 `MarkDeferred`，消息一直 `pending` | **不会自动转 failed**；由「最老 pending > 5min」的 `[ALERT]` 兜底 |
 
-第二种是真实存在的边界：**当前代码把「连接级故障」和「单条消息故障」都算作一次重试**。更严谨的做法是分类错误：
+**为什么必须分流：** 如果所有失败都算一次重试，那么「MQ 停机 2 分钟」就足以把积压消息全部烧成 `failed`——基础设施故障被误判成消息问题，恢复后还得人工重放。分流后，MQ 故障的代价只是**延迟**，不是**终态**。
 
-- 连接/通道错误 → 不消耗重试额度（或重置 `retry_count`），只做退避重连；
-- 协议级 NACK、消息体问题 → 才消耗额度并最终转 `failed`；
-- 同时对 `failed` 增长做告警，并提供批量重置入口。
+**还剩的两个边界：**
+
+1. **永久性拓扑损坏不会自动进 failed**：一直被 `MarkDeferred`，行数留在 `pending`。这是刻意的取舍——宁可让消息等着，也不把可能正确的消息判死；代价是靠告警而不是重试次数发现问题；
+2. **`mandatory=false` 下的不可路由消息**：broker 仍会 ACK，本地会标 `sent`。要堵住这个洞需要 `mandatory=true + NotifyReturn`，目前没有做。
 
 **恢复后补发节奏：**
 
@@ -666,10 +688,12 @@ ORDER BY id ASC LIMIT 100;
 - 代价：MySQL 要求**每个唯一键都包含分区列**，现有 `PRIMARY KEY(id)` 和 `UNIQUE(event_id)` 都要加上 `create_time`，属于 schema 级改动；
 - 分区不是「性能银弹」，它主要解决**清理成本**和**单分区扫描量**，不解决查询本身写得烂的问题。
 
-**顺手要补的两个细节：**
+**已经补上的两个细节：**
 
-1. `PurgeSent` 目前是一条大 `DELETE`，存量很大时应改成**分批删除**（`LIMIT 1000` 循环），避免长事务、锁等待和主从延迟；
-2. `PurgeSent` 只清 `sent`，`failed` 和长期 `pending` 需要有独立的处理策略，否则「清理」并不能真正控制总量。
+1. `PurgeSent` 改成 **`LIMIT 1000` 循环删除**，每批之间检查 `ctx.Done()`，避免长事务、锁等待和主从延迟（`outbox_repo.go:237-257`）；
+2. `failed` 不再是无人区：每分钟 `Stats` 统计、`failed > 0` 打 `[ALERT]`、`/admin/outbox/failed` 查询、`/admin/outbox/replay` 重放（`outboxworker.go:358-360`、`http/outbox_admin.go`）。长期 `pending` 也有 5 分钟阈值告警。
+
+**仍缺的：** `failed` 的历史归档表、按时间分区都还没做。当前靠 `PurgeSent` 控制 `sent` 存量、靠人工重放控制 `failed` 存量；真到千万级再上 `DROP PARTITION`。
 
 **加分：** 「Outbox 的特点是稳态行数很低——消息发完就清。真正撑爆它的只有投递长时间失败这种异常场景，那应该告警，而不是靠扩容掩盖。」
 
@@ -681,7 +705,7 @@ ORDER BY id ASC LIMIT 100;
 
 **先讲本项目的事实：**
 
-`outbox_msgs` 没有 `payload` 列。事件体在发布时由行字段现场构造（`timelineMQ.go:99-104`）：
+`outbox_msgs` 没有 `payload` 列。事件体在发布时由行字段现场构造（`timelineMQ.go:108-113`）：
 
 ```json
 { "event_id": "...", "video_id": 987, "create_time": 1761300000000, "occurred_at": "..." }
@@ -710,7 +734,7 @@ ORDER BY id ASC LIMIT 100;
 
 **本项目的已知边界：** 引用型事件 + ZSET 只存 ID，带来两个后果：
 
-1. 视频被删除后，`video_id` 仍留在 ZSET 里，读取时靠 `GetVideoByIDs` 过滤，可能导致当页条数不足；
+1. 视频被删除时 `Delete` 会尽力 `ZRem` 热时间线（`video_service.go:107-116`）；Redis 失败不回滚删除，残留项由读路径 `GetVideoByIDs` 过滤 + 后台对账/空 ZSET 重建兜底，极端情况下当页条数会略少；
 2. 消费端不感知「视频标题改了」这类变化——但时间线本来就不展示事件快照，所以无影响。
 
 ---
@@ -756,18 +780,18 @@ ZAdd(key, Z{Score: float64(event.CreateTime), Member: videoID})
 
 ## 19. 如果 Outbox 消息最终进入死信状态，业务方如何发现、排查并人工补偿？人工重放会不会重复执行？
 
-**一句话：** 本模块有**两个不同的「死信」**——发布端的 `outbox_msgs.status='failed'` 和消费端的 `<queue>.dlx`；前者靠 SQL 发现，后者靠队列深度/告警发现，重放都靠「重置状态」或「重新投递」，重复由幂等兜住。
+**一句话：** 本模块有**两个不同的「死信」**——发布端的 `outbox_msgs.status='failed'` 和消费端的 `<queue>.dlx`；前者靠每分钟统计/`[ALERT]` + 管理接口发现，后者靠队列深度、指标和 `dead_letters` 落表发现；重放靠管理接口或 SQL，重复由幂等兜住。
 
 **先分清两个终点：**
 
 | | 发布端 failed | 消费端 DLQ |
 |---|---|---|
-| 触发条件 | 投递失败 5 次（或回收超额度） | 本地 4 次 + 重试队列 3 轮仍失败 |
-| 存储 | `outbox_msgs` 表 | `video.timeline.update.queue.dlx` |
-| 是否自动重试 | 否，终态 | 否，只告警 |
+| 触发条件 | 投递失败 5 次（或回收超额度） | 本地重试（默认 1+3，时间线 1+1）+ 重试队列 3 轮仍失败 |
+| 存储 | `outbox_msgs` 表（含 `last_error`） | `video.timeline.update.queue.dlx`，消费者再落 `dead_letters` 表 |
+| 是否自动重试 | 否，终态 | 否，只落表 + 告警 |
 | 消息体 | `video_id + create_time + event_id` | 完整事件 JSON + `x-death` 头 |
 
-**发现（当前能力 + 缺口）：**
+**发现（已落地 + 剩余缺口）：**
 
 ```sql
 -- 发布端：失败量、卡死量、积压时长
@@ -776,25 +800,38 @@ SELECT COUNT(*) FROM outbox_msgs WHERE status='processing' AND claimed_at < now(
 SELECT MIN(create_time) FROM outbox_msgs WHERE status='pending';
 ```
 
-- 消费端：RabbitMQ 管理台/exporter 看 `<queue>.dlx` 的 `messages_ready`；
-- **已知缺口**：`failed` 目前只打日志，没有告警和后台管理接口；DLQ 消费者目前也只打日志。这是文档里明确列出的待补项，面试时应主动说，而不是等面试官问出来。
+- 消费端：RabbitMQ 管理台/exporter 看 `<queue>.dlx` 的 `messages_ready`；DLQ 消费者还会把消息落 `dead_letters` 表（`queue / exchange / routing_key / event_id / retry_count / reason / body`），`(queue, event_id)` 唯一索引 + `INSERT IGNORE` 保证「落库成功、ACK 前崩溃」的重投不产生重复记录；落表失败重试 3 次，之后仍 Ack——继续 requeue 只会让一条注定失败的消息反复冲击数据库；
+- **已落地的发现手段**：poller 每分钟统计一次，`failed > 0` 打 `[ALERT]`（`outboxworker.go:358-360`）；同一份数据写成 `/metrics` gauge；`GET /admin/outbox/stats` 和 `GET /admin/outbox/failed` 提供实时查询。
+- **仍然缺的**：DLQ 没有自动重放工具（只能人工重新发布），`failed` 的历史归档也没做。这两点面试时可以主动交代。
 
 **排查顺序：**
 
-1. 看 `retry_count` 和最近日志里的错误：网络/超时/NACK 是环境问题，反序列化/字段非法是毒消息；
+1. 看 `last_error`（每次失败/回收都会覆盖写入）：网络/超时/NACK 是环境问题，反序列化/字段非法是毒消息；
 2. 看同一时间段 broker 是否有磁盘/内存告警、连接 blocked、队列被删；
-3. 看消费端 DLQ 的 `x-death` 头：`reason`（rejected/expired）、`queue`、`count`，能直接定位是哪一级失败；
+3. 看消费端 DLQ 的 `x-death` 头或 `dead_letters` 表：`reason`（rejected/expired）、`queue`、`count`，能直接定位是哪一级失败；
 4. 看 Redis/MySQL 是否在故障窗口内（写 ZSET 失败会一路重试到 DLQ）；
 5. 抽样核对 `video_id` 在 `videos` 表是否存在——不存在说明是脏事件，重放也没意义。
 
 **人工补偿路径：**
 
-**A. 发布端 `failed` 重放**
+**A. 发布端 `failed` 重放（优先用管理接口）**
+
+```http
+GET  /admin/outbox/stats
+GET  /admin/outbox/failed?limit=50
+POST /admin/outbox/replay        Body: {"id": 12} 或 {"ids": [12,13]}
+Header: X-Admin-Token: <ADMIN_TOKEN>
+```
+
+- 只有配置了 `ADMIN_TOKEN` 才注册这些路由（默认不暴露），token 用 `subtle.ConstantTimeCompare` 比较，避免时序侧信道；
+- `Replay` 只重置 `status='failed'` 的行，重复调用幂等；单次最多 200 个 ID；
+- 重置时同时清 `retry_count / next_retry_at / claimed_at / claim_token / last_error`（`outbox_repo.go:290-307`）；
+- 没有配置 token 时，等价的 SQL：
 
 ```sql
 UPDATE outbox_msgs
 SET status='pending', retry_count=0, next_retry_at=NULL,
-    claimed_at=NULL, claim_token=NULL
+    claimed_at=NULL, claim_token=NULL, last_error=NULL
 WHERE id=? AND status='failed';
 ```
 
@@ -804,9 +841,9 @@ poller 下一轮就会捞走。因为 `event_id` 和 `create_time` 都没改：
 - ZSET 的 score 仍是原始发布时间，**重放不会把旧视频排到最前面**；
 - 如果这条视频已经滚出最近 1000 条，`ZADD` 后会被 `ZREMRANGEBYRANK` 立刻裁掉——无害。
 
-**B. 消费端 DLQ 重放**
+**B. 消费端 DLQ 重放（目前仍需人工）**
 
-把死信消息体重新发布到主交换机 + 原始 routing key。可以用管理台、`rabbitmqadmin` 或写一个小工具；重放前建议限速，避免 Redis/DB 被打出尖峰。
+从 `dead_letters` 表或 RabbitMQ 管理台取出消息体，重新发布到主交换机 + 原始 routing key。可以用管理台、`rabbitmqadmin` 或写一个小工具；重放前建议限速，避免 Redis/DB 被打出尖峰。**没有做自动重放**：自动重放有毒消息只会形成「进死信 → 重放 → 再进死信」的循环。
 
 **C. 不补偿：重建热时间线**
 
@@ -825,7 +862,7 @@ ZSET 冷启动/被清空时本来就会从 MySQL 拉最新 1000 条重建。如�
 - 或 Redis Lua 原子判重；
 - 重放工具带审计日志（谁、何时、重放了哪些 `event_id`），避免「以为没重放，实际放了两遍」。
 
-**回答的收尾口径：** 「死信不是丢弃，而是把失败变成可见状态。当前项目的缺口是缺告警和管理入口，不是缺数据——消息体和事件 ID 都在，随时可以重放。」
+**回答的收尾口径：** 「死信不是丢弃，而是把失败变成可见状态。发布端的 `failed` 已经有告警、查询和批量重放接口；消费端的 DLQ 会落表并保留完整消息体和事件 ID。现在剩下的边界是：DLQ 还没有自动重放工具，`failed` 的长期归档也没做——这些是运维工具层面的缺口，不是数据层面的缺口。」
 
 ---
 
@@ -838,17 +875,17 @@ ZSET 冷启动/被清空时本来就会从 MySQL 拉最新 1000 条重建。如�
 | 业务数据与消息记录**同事务**，不会出现「有视频没消息」或「有消息没视频」 | 「消息绝对不丢」——broker 磁盘损坏、队列误删仍可能丢 |
 | 投递是 **at-least-once**，重复由消费端幂等消化 | 「exactly-once 投递」 |
 | 时间线更新是**幂等**的，重复执行结果一致 | 「端到端严格恰好一次」 |
-| MQ 整机不可用期间**不丢数据**，恢复后自动补发 | 「任何 MQ 故障都能无损恢复」——半死不活时会烧重试额度 |
+| MQ 整机不可用期间**不丢数据**，恢复后自动补发；连接级故障**不烧重试额度** | 「任何 MQ 故障都能自动恢复」——永久性拓扑损坏会让消息一直 `pending`，靠告警发现 |
 | 多实例下靠 CAS 把重复压到极低频 | 「CAS 保证不重复投递」——它只保证并发唯一 |
-| 失败会进入 `failed`/DLQ，**可查可重放** | 「失败会自动兜底」——目前需要人工介入 |
+| 失败会进入 `failed`/DLQ，**可查、可重放** | 「失败会自动兜底」——发布端要人工触发重放，DLQ 要人工重新发布 |
 
 ## B. 被追问「你这套可靠性怎么证明」时的四层回答
 
 ```
 ① 不变量：业务行与 outbox 行同事务（可演示回滚）
 ② 故障注入：MQ 断开 / 杀进程 / 并发双实例 / Redis 宕机
-③ 观测：pending 数、最老积压时长、processing 卡死数、failed 数
-④ 残留风险：半死不活的 broker 会烧额度；failed/DLQ 缺告警入口
+③ 观测：每分钟 Stats + /metrics gauge + [ALERT] 日志 + /admin/outbox/*
+④ 残留风险：永久性拓扑损坏会一直 pending；DLQ 无自动重放；租约不续期
 ```
 
 ## C. 一页速查 SQL
@@ -863,11 +900,23 @@ SELECT COUNT(*) FROM outbox_msgs
 WHERE status='processing' AND claimed_at < NOW() - INTERVAL 60 SECOND;
 -- 终态失败
 SELECT * FROM outbox_msgs WHERE status='failed' ORDER BY id DESC LIMIT 50;
--- 人工重放
+-- 最近失败原因
+SELECT id, event_id, retry_count, last_error
+FROM outbox_msgs WHERE status='failed' ORDER BY id DESC LIMIT 50;
+-- 人工重放（等价于 POST /admin/outbox/replay）
 UPDATE outbox_msgs
 SET status='pending', retry_count=0, next_retry_at=NULL,
-    claimed_at=NULL, claim_token=NULL
+    claimed_at=NULL, claim_token=NULL, last_error=NULL
 WHERE id=? AND status='failed';
+```
+
+**运维接口：**
+
+```http
+GET  /admin/outbox/stats          # pending/processing/failed/stuck/最老 pending
+GET  /admin/outbox/failed?limit=50
+POST /admin/outbox/replay         # {"id":12} 或 {"ids":[12,13]}，最多 200
+X-Admin-Token: <ADMIN_TOKEN>
 ```
 
 ## D. 一句话收尾

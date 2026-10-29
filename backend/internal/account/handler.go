@@ -5,14 +5,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
-	"os"
-	"path"
-	"path/filepath"
-	"strconv"
 	"strings"
 
 	"feedsystem_video_go/internal/apierror"
+	"feedsystem_video_go/internal/storage"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -20,10 +18,11 @@ import (
 
 type AccountHandler struct {
 	accountService *AccountService
+	storage        storage.Storage
 }
 
-func NewAccountHandler(accountService *AccountService) *AccountHandler {
-	return &AccountHandler{accountService: accountService}
+func NewAccountHandler(accountService *AccountService, store storage.Storage) *AccountHandler {
+	return &AccountHandler{accountService: accountService, storage: store}
 }
 func (h *AccountHandler) CreateAccount(c *gin.Context) {
 	var req CreateAccountRequest
@@ -105,6 +104,7 @@ func (h *AccountHandler) FindByID(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	} else {
+		h.resolveAvatar(c, account)
 		c.JSON(200, account)
 	}
 }
@@ -119,7 +119,18 @@ func (h *AccountHandler) FindByUsername(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	} else {
+		h.resolveAvatar(c, account)
 		c.JSON(200, account)
+	}
+}
+
+// resolveAvatar 把账号里的 avatar key 解析成可访问 URL（预签名 / 本地静态路径）。
+func (h *AccountHandler) resolveAvatar(c *gin.Context, account *Account) {
+	if account == nil || account.AvatarURL == "" {
+		return
+	}
+	if u, err := h.storage.Resolve(c.Request.Context(), account.AvatarURL); err == nil {
+		account.AvatarURL = u
 	}
 }
 
@@ -171,16 +182,11 @@ func (h *AccountHandler) UploadAvatar(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file size"})
 		return
 	}
-	ext := strings.ToLower(filepath.Ext(f.Filename))
+	ext := strings.ToLower(getExt(f.Filename))
 	switch ext {
 	case ".jpg", ".jpeg", ".png", ".webp":
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "only .jpg/.jpeg/.png/.webp allowed"})
-		return
-	}
-	dir := filepath.Join(".run", "uploads", "avatars", strconv.FormatUint(uint64(accountID), 10))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	filename, err := randHex(16)
@@ -188,19 +194,28 @@ func (h *AccountHandler) UploadAvatar(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	filename = filename + ext
-	absPath := filepath.Join(dir, filename)
-	if err := c.SaveUploadedFile(f, absPath); err != nil {
+	key := fmt.Sprintf("avatars/%d/%s%s", accountID, filename, ext)
+
+	src, err := f.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
+	defer src.Close()
+
+	if err := h.storage.Put(c.Request.Context(), key, src, f.Size, avatarContentType(ext)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	urlPath := path.Join("/static", "avatars", strconv.FormatUint(uint64(accountID), 10), filename)
-	avatarURL := buildAbsoluteURL(c, urlPath)
-	if err := h.accountService.UpdateAvatar(c.Request.Context(), accountID, avatarURL); err != nil {
+	url, err := h.storage.Resolve(c.Request.Context(), key)
+	if err != nil {
+		url = key
+	}
+	if err := h.accountService.UpdateAvatar(c.Request.Context(), accountID, key); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"avatar_url": avatarURL})
+	c.JSON(http.StatusOK, gin.H{"key": key, "avatar_url": url})
 }
 
 func (h *AccountHandler) UpdateProfile(c *gin.Context) {
@@ -227,12 +242,21 @@ func (h *AccountHandler) Refresh(c *gin.Context) {
 		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
 		return
 	}
-	newToken, accountID, username, err := h.accountService.RefreshAccessToken(c.Request.Context(), req.RefreshToken)
+	result, err := h.accountService.RefreshAccessToken(c.Request.Context(), req.RefreshToken)
 	if err != nil {
+		if errors.Is(err, ErrRefreshReuse) {
+			log.Printf("refresh rejected: reuse detected; account tokens revoked")
+		}
+		// 对外统一成同一句话：不向攻击者区分「格式错 / 过期 / 重放」。
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid refresh token"})
 		return
 	}
-	c.JSON(http.StatusOK, LoginResponse{Token: newToken, AccountID: accountID, Username: username})
+	c.JSON(http.StatusOK, LoginResponse{
+		Token:        result.AccessToken,
+		RefreshToken: result.RefreshToken,
+		AccountID:    result.AccountID,
+		Username:     result.Username,
+	})
 }
 
 func randHex(n int) (string, error) {
@@ -241,17 +265,6 @@ func randHex(n int) (string, error) {
 		return "", fmt.Errorf("rand.Read: %w", err)
 	}
 	return hex.EncodeToString(b), nil
-}
-
-func buildAbsoluteURL(c *gin.Context, p string) string {
-	scheme := "http"
-	if c.Request.TLS != nil {
-		scheme = "https"
-	}
-	if xf := c.GetHeader("X-Forwarded-Proto"); xf != "" {
-		scheme = xf
-	}
-	return fmt.Sprintf("%s://%s%s", scheme, c.Request.Host, p)
 }
 
 func getAccountID(c *gin.Context) (uint, error) {
@@ -264,4 +277,25 @@ func getAccountID(c *gin.Context) (uint, error) {
 		return 0, errors.New("accountID has invalid type")
 	}
 	return id, nil
+}
+
+func getExt(name string) string {
+	idx := strings.LastIndexByte(name, '.')
+	if idx < 0 {
+		return ""
+	}
+	return name[idx:]
+}
+
+func avatarContentType(ext string) string {
+	switch ext {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "application/octet-stream"
+	}
 }

@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -100,8 +101,27 @@ func (h *SSEHub) SSERequireAuth() gin.HandlerFunc {
 			return
 		}
 		c.Set("accountID", claims.AccountID)
+		c.Set("sseToken", token)
 		c.Next()
 	}
+}
+
+// stillAuthorized 复查长连接持有的凭证。
+//
+// 长连接不能只靠握手那一次校验：token 过期、登出、改密、顶号之后，
+// 已建立的连接必须被主动断掉，否则它就是一条绕过吊销的旁路。
+// 因此 SSE 连接的最长寿命 = access token 的剩余寿命，客户端必须用新 token 重连。
+func (h *SSEHub) stillAuthorized(ctx context.Context, c *gin.Context) bool {
+	raw, ok := c.Get("sseToken")
+	if !ok {
+		return false
+	}
+	token, ok := raw.(string)
+	if !ok || token == "" {
+		return false
+	}
+	_, valid := jwt.VerifyToken(ctx, token, h.accountRepo, h.cache)
+	return valid
 }
 
 func (h *SSEHub) SSEHandler(c *gin.Context) {
@@ -122,6 +142,11 @@ func (h *SSEHub) SSEHandler(c *gin.Context) {
 	ctx := c.Request.Context()
 	flusher, _ := c.Writer.(http.Flusher)
 
+	// 用 Ticker 而不是 time.After：通知密集时 time.After 每轮都重置，
+	// 复查会被无限推迟，等于没做。
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -135,7 +160,10 @@ func (h *SSEHub) SSEHandler(c *gin.Context) {
 			if flusher != nil {
 				flusher.Flush()
 			}
-		case <-time.After(30 * time.Second):
+		case <-ticker.C:
+			if !h.stillAuthorized(ctx, c) {
+				return
+			}
 			fmt.Fprintf(c.Writer, ": keepalive\n\n")
 			if flusher != nil {
 				flusher.Flush()

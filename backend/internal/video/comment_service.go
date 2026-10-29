@@ -8,6 +8,7 @@ import (
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"log"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -107,13 +108,41 @@ func (s *CommentService) Delete(ctx context.Context, commentID uint, accountID u
 	if comment.AuthorID != accountID {
 		return apierror.ErrUnauthorized
 	}
+
+	// 热度 -1 的幂等键按评论 ID 固定，而不是每次请求随机生成：
+	// 并发重复删除时，只有第一次能把热度减下去。
+	popEventID := "comment-del:" + strconv.FormatUint(uint64(commentID), 10)
+
+	mysqlEnqueued := false
+	redisEnqueued := false
 	if s.commentMQ != nil {
 		if err := s.commentMQ.Delete(ctx, commentID); err == nil {
-			return nil
+			mysqlEnqueued = true
 		}
 	}
-	// 降级：直接删除。删除天然幂等，重复执行不会报错也不会产生副作用。
-	return s.repo.ApplyDelete(ctx, commentID)
+	if s.popularityMQ != nil {
+		if err := s.popularityMQ.Update(ctx, comment.VideoID, -1, popEventID); err == nil {
+			redisEnqueued = true
+		}
+	}
+	if mysqlEnqueued && redisEnqueued {
+		return nil
+	}
+
+	// 降级：删除评论与热度 -1 在同一事务里完成；RowsAffected=0 时不会重复减。
+	if !mysqlEnqueued {
+		if err := s.repo.ApplyDelete(ctx, commentID); err != nil {
+			return err
+		}
+	}
+
+	// 降级：热度事件发布失败时直写 Redis；失败只记日志，不影响删除本身。
+	if !redisEnqueued {
+		if err := UpdatePopularityCache(ctx, s.cache, comment.VideoID, -1, popEventID); err != nil {
+			log.Printf("comment delete fallback: update popularity cache failed (video=%d): %v", comment.VideoID, err)
+		}
+	}
+	return nil
 }
 
 func (s *CommentService) GetAll(ctx context.Context, videoID uint) ([]Comment, error) {

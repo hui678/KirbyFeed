@@ -2,6 +2,7 @@ package video
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
@@ -14,8 +15,10 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	rediscache "feedsystem_video_go/internal/middleware/redis"
+	"feedsystem_video_go/internal/storage"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
@@ -39,7 +42,7 @@ func setupTestEnv(t *testing.T) (*ChunkUploadHandler, func()) {
 		goredis.NewClient(&goredis.Options{Addr: mr.Addr()}),
 		"",
 	)
-	handler := NewChunkUploadHandler(client)
+	handler := NewChunkUploadHandler(client, storage.NewLocal(".run/uploads"))
 
 	origDir, _ := os.Getwd()
 	tmpDir, err := os.MkdirTemp("", "chunk-upload-test-*")
@@ -733,5 +736,209 @@ func TestCompleteReportsAllMissingChunksAndRecovers(t *testing.T) {
 	res := completeUpload(t, h, uploadID)
 	if url, ok := res["url"].(string); !ok || url == "" {
 		t.Fatalf("expected url after recovery, got %v", res)
+	}
+}
+
+// TestConcurrentSameChunkUploadIsSafe：客户端「响应丢了 → 同一片多路重传」很常见。
+// 旧实现所有请求共用一个 {index}.part，先完成者的 rename 会把后者正在写的文件搬走；
+// 临时文件名按请求唯一后，同片并发只会互相覆盖最终结果，不会互相破坏。
+func TestConcurrentSameChunkUploadIsSafe(t *testing.T) {
+	h, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	chunkSize := 4096
+	totalChunks := 2
+	chunks, chunkHashes, fileHash := makeTestChunks(t, totalChunks, chunkSize)
+	uploadID := initUpload(t, h, "same-chunk.mp4", int64(totalChunks*chunkSize), int64(chunkSize), totalChunks, fileHash)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, rec := newMultipartContext(t, "/video/chunk/upload", map[string]string{
+				"upload_id":   uploadID,
+				"chunk_index": "0",
+				"chunk_hash":  chunkHashes[0],
+			}, chunks[0])
+			h.UploadChunk(c)
+			if rec.Code != http.StatusOK {
+				errs <- fmt.Errorf("same chunk upload: got %d, body %s", rec.Code, rec.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent same-chunk upload failed: %v", err)
+	}
+
+	// 临时文件必须全部收干净，不能留下任何 .part
+	entries, err := os.ReadDir(filepath.Join(".run", "uploads", "tmp", uploadID))
+	if err != nil {
+		t.Fatalf("read tmp dir: %v", err)
+	}
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".part" {
+			t.Fatalf("stale part file left behind: %s", e.Name())
+		}
+	}
+
+	uploadChunk(t, h, uploadID, 1, chunkHashes[1], chunks[1])
+	resp := completeUpload(t, h, uploadID)
+	merged := readMergedFile(t, resp)
+
+	var expected bytes.Buffer
+	expected.Write(chunks[0])
+	expected.Write(chunks[1])
+	if !bytes.Equal(merged, expected.Bytes()) {
+		t.Fatal("merged file corrupted by concurrent same-chunk upload")
+	}
+}
+
+// TestFileHashMismatchInvalidatesSession：整文件校验失败后必须丢弃会话。
+// 否则客户端每次 complete 都对着同一份必然失败的数据重试，卡到 24h TTL 过期。
+func TestFileHashMismatchInvalidatesSession(t *testing.T) {
+	h, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	chunkSize := 128
+	totalChunks := 2
+	chunks, chunkHashes, _ := makeTestChunks(t, totalChunks, chunkSize)
+	wrongHash := computeMD5([]byte("definitely-not-this-file"))
+
+	uploadID := initUpload(t, h, "stuck.mp4", int64(totalChunks*chunkSize), int64(chunkSize), totalChunks, wrongHash)
+	for i := 0; i < totalChunks; i++ {
+		uploadChunk(t, h, uploadID, i, chunkHashes[i], chunks[i])
+	}
+
+	c, rec := newJSONContext(t, "/video/chunk/complete", CompleteChunkUploadRequest{UploadID: uploadID})
+	h.CompleteChunkUpload(c)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for file hash mismatch, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if code := parseJSON(t, rec)["code"]; code != "file_hash_mismatch" {
+		t.Fatalf("expected code=file_hash_mismatch, got %v", code)
+	}
+
+	// 会话与种子目录都必须被清掉：重复 complete 只能是 404，而不是一直 400
+	c, rec = newJSONContext(t, "/video/chunk/complete", CompleteChunkUploadRequest{UploadID: uploadID})
+	h.CompleteChunkUpload(c)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 after invalidation, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(".run", "uploads", "tmp", uploadID)); !os.IsNotExist(err) {
+		t.Fatal("tmp dir should be removed after invalidation")
+	}
+
+	// 同一文件重新 init 必须拿到全新会话，而不是再次命中坏会话
+	newID := initUpload(t, h, "stuck.mp4", int64(totalChunks*chunkSize), int64(chunkSize), totalChunks, wrongHash)
+	if newID == uploadID {
+		t.Fatal("re-init should create a new session after invalidation")
+	}
+}
+
+// TestCompleteReplayChecksOwnership：结果回放发生在读取会话之前，
+// 必须自带归属校验，否则知道 upload_id 就能拿到别人的 play_url。
+func TestCompleteReplayChecksOwnership(t *testing.T) {
+	h, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	chunkSize := 128
+	totalChunks := 1
+	chunks, chunkHashes, fileHash := makeTestChunks(t, totalChunks, chunkSize)
+	uploadID := initUpload(t, h, "private.mp4", int64(chunkSize), int64(chunkSize), totalChunks, fileHash)
+	uploadChunk(t, h, uploadID, 0, chunkHashes[0], chunks[0])
+
+	if res := completeUpload(t, h, uploadID); res["url"] == nil {
+		t.Fatalf("complete failed: %v", res)
+	}
+
+	c, rec := newJSONContext(t, "/video/chunk/complete", CompleteChunkUploadRequest{UploadID: uploadID})
+	c.Set("accountID", uint(999))
+	h.CompleteChunkUpload(c)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for foreign replay, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRenameReplaceKeepsDestinationWhenSourceMissing：Windows 的 rename 不能覆盖，
+// 回退路径如果先删目标再 rename 一个不存在的源，就会把唯一的好文件也删掉。
+func TestRenameReplaceKeepsDestinationWhenSourceMissing(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "final")
+	if err := os.WriteFile(dst, []byte("keep-me"), 0o644); err != nil {
+		t.Fatalf("write dst: %v", err)
+	}
+
+	if err := renameReplace(filepath.Join(dir, "missing"), dst); err == nil {
+		t.Fatal("expected error when source is missing")
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("destination was deleted: %v", err)
+	}
+	if string(got) != "keep-me" {
+		t.Fatalf("destination corrupted: %q", got)
+	}
+}
+
+// TestSweepStaleUploads：只清「没有活会话且足够旧」的目录，以及崩溃留下的 .mp4.part。
+func TestSweepStaleUploads(t *testing.T) {
+	h, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	chunkSize := 128
+	totalChunks := 1
+	chunks, chunkHashes, fileHash := makeTestChunks(t, totalChunks, chunkSize)
+	liveID := initUpload(t, h, "live.mp4", int64(chunkSize), int64(chunkSize), totalChunks, fileHash)
+	uploadChunk(t, h, liveID, 0, chunkHashes[0], chunks[0])
+
+	root := filepath.Join(".run", "uploads")
+	liveDir := filepath.Join(root, "tmp", liveID)
+	deadDir := filepath.Join(root, "tmp", "dead-upload")
+	freshDir := filepath.Join(root, "tmp", "fresh-upload")
+	for _, dir := range []string{deadDir, freshDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(deadDir, "0"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write dead chunk: %v", err)
+	}
+
+	old := time.Now().Add(-48 * time.Hour)
+	for _, dir := range []string{liveDir, deadDir} {
+		if err := os.Chtimes(dir, old, old); err != nil {
+			t.Fatalf("chtimes %s: %v", dir, err)
+		}
+	}
+
+	partDir := filepath.Join(root, "videos", "1", "20260101")
+	if err := os.MkdirAll(partDir, 0o755); err != nil {
+		t.Fatalf("mkdir part dir: %v", err)
+	}
+	partFile := filepath.Join(partDir, "crash.mp4.part")
+	if err := os.WriteFile(partFile, []byte("partial"), 0o644); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
+	if err := os.Chtimes(partFile, old, old); err != nil {
+		t.Fatalf("chtimes part: %v", err)
+	}
+
+	h.sweepStaleUploads(context.Background(), time.Now())
+
+	if _, err := os.Stat(deadDir); !os.IsNotExist(err) {
+		t.Fatal("stale dir without session should be removed")
+	}
+	if _, err := os.Stat(freshDir); err != nil {
+		t.Fatal("fresh dir must be kept")
+	}
+	if _, err := os.Stat(liveDir); err != nil {
+		t.Fatal("dir with live session must be kept")
+	}
+	if _, err := os.Stat(partFile); !os.IsNotExist(err) {
+		t.Fatal("stale .mp4.part should be removed")
 	}
 }

@@ -4,12 +4,14 @@ import { useRoute, useRouter } from 'vue-router'
 
 import AppShell from '../components/AppShell.vue'
 import CommentDrawer from '../components/CommentDrawer.vue'
+import HotRankPanel from '../components/HotRankPanel.vue'
+import TopicFeedPanel from '../components/TopicFeedPanel.vue'
 import UserAvatar from '../components/UserAvatar.vue'
 import type { FeedVideoItem } from '../api/types'
 import { useAuthStore } from '../stores/auth'
 import { useSocialStore } from '../stores/social'
 import { useToastStore } from '../stores/toast'
-import { useVideoFeed } from '../composables/useVideoFeed'
+import { useVideoFeed, type TabKey } from '../composables/useVideoFeed'
 import { useVideoPlayer } from '../composables/useVideoPlayer'
 import { useLikeFollow } from '../composables/useLikeFollow'
 
@@ -20,6 +22,27 @@ const social = useSocialStore()
 const toast = useToastStore()
 
 const { tab, following, currentState, loadFollowing, ensureTabLoaded, loadMoreIfNeeded } = useVideoFeed()
+
+const tabs: { key: TabKey; label: string }[] = [
+  { key: 'recommend', label: '推荐' },
+  { key: 'following', label: '关注' },
+  { key: 'hot', label: '热榜' },
+  { key: 'topic', label: '话题' },
+]
+
+// 只有推荐/关注是上下滑动的视频流；热榜和话题是列表，滚动交给面板内部。
+const isSwipeTab = computed(() => tab.value === 'recommend' || tab.value === 'following')
+
+function tabFromQuery(): TabKey {
+  const t = route.query.tab
+  if (t === 'following' || t === 'hot' || t === 'topic') return t
+  return 'recommend'
+}
+
+function selectTab(next: TabKey) {
+  tab.value = next
+  void router.replace({ path: '/', query: next === 'recommend' ? {} : { tab: next } })
+}
 const scroller = ref<HTMLDivElement | null>(null)
 const { muted, activeIndex, videoMap, setVideoRef, scrollToIndex, onScroll, playActive, toggleMute, togglePlayPause } = useVideoPlayer(scroller)
 
@@ -42,7 +65,7 @@ const filteredItems = computed(() => {
   if (!q.value) return items
   return items.filter((v) => v.title.toLowerCase().includes(q.value) || v.author.username.toLowerCase().includes(q.value))
 })
-const activeItem = computed(() => filteredItems.value[activeIndex.value] ?? null)
+const activeItem = computed(() => (isSwipeTab.value ? filteredItems.value[activeIndex.value] ?? null : null))
 const visibleRange = computed(() => {
   const idx = activeIndex.value
   const len = filteredItems.value.length
@@ -51,6 +74,7 @@ const visibleRange = computed(() => {
 const myAccountId = computed(() => auth.claims?.account_id ?? 0)
 
 watch(activeItem, async () => {
+  if (!isSwipeTab.value) return
   await nextTick()
   await playActive(activeItem.value?.id)
   await loadMoreIfNeeded(activeIndex.value)
@@ -62,10 +86,16 @@ watch(() => tab.value, async () => {
   if (scroller.value) scroller.value.scrollTop = 0
   await ensureTabLoaded()
   await nextTick()
-  await playActive(activeItem.value?.id)
+  if (isSwipeTab.value) await playActive(activeItem.value?.id)
+})
+
+watch(() => route.query.tab, () => {
+  const next = tabFromQuery()
+  if (next !== tab.value) tab.value = next
 })
 
 watch(() => q.value, async () => {
+  if (!isSwipeTab.value) return
   activeIndex.value = 0
   if (scroller.value) scroller.value.scrollTop = 0
   await nextTick()
@@ -82,6 +112,7 @@ watch(() => auth.isLoggedIn, async (v) => {
 })
 
 async function onKeydown(e: KeyboardEvent) {
+  if (!isSwipeTab.value) return
   const t = e.target as HTMLElement | null
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return
   if (drawerOpen.value) return
@@ -93,9 +124,10 @@ async function onKeydown(e: KeyboardEvent) {
 }
 
 onMounted(async () => {
+  tab.value = tabFromQuery()
   await ensureTabLoaded()
   await nextTick()
-  await playActive(activeItem.value?.id)
+  if (isSwipeTab.value) await playActive(activeItem.value?.id)
   window.addEventListener('keydown', onKeydown)
 })
 
@@ -106,16 +138,23 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   <AppShell full>
     <div class="page">
       <div class="tabs">
-        <button class="tab" :class="{ on: tab === 'recommend' }" type="button" @click="tab = 'recommend'">推荐</button>
-        <button class="tab" :class="{ on: tab === 'following' }" type="button" @click="tab = 'following'">关注</button>
-        <button class="tab" :class="{ on: tab === 'hot' }" type="button" @click="tab = 'hot'">点赞榜</button>
-        <div class="tabs-right">
+        <button
+          v-for="t in tabs"
+          :key="t.key"
+          class="tab"
+          :class="{ on: tab === t.key }"
+          type="button"
+          @click="selectTab(t.key)"
+        >
+          {{ t.label }}
+        </button>
+        <div v-if="isSwipeTab" class="tabs-right">
           <button class="chip" type="button" @click="toggleMute">{{ muted ? '静音' : '有声' }}</button>
           <RouterLink class="chip" :to="activeItem ? `/video/${activeItem.id}` : '/video'">详情</RouterLink>
         </div>
       </div>
 
-      <div ref="scroller" class="scroller" @scroll="onScroll">
+      <div v-if="isSwipeTab" ref="scroller" class="scroller" @scroll="onScroll">
         <div v-if="currentState.loading && currentState.items.length === 0" class="center-hint">加载中…</div>
         <div v-else-if="currentState.error && currentState.items.length === 0" class="center-hint bad">{{ currentState.error }}</div>
         <div v-else-if="filteredItems.length === 0" class="center-hint">没有匹配内容</div>
@@ -176,6 +215,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
         </section>
       </div>
 
+      <div v-else class="panel-scroll">
+        <HotRankPanel v-if="tab === 'hot'" />
+        <TopicFeedPanel v-else-if="tab === 'topic'" />
+      </div>
+
       <CommentDrawer v-if="drawerOpen" :video="drawerVideo" @close="closeDrawer" />
     </div>
   </AppShell>
@@ -189,6 +233,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 .tabs-right { margin-left: auto; display: flex; gap: 10px; align-items: center; }
 .scroller { flex: 1; min-height: 0; overflow-y: auto; scroll-snap-type: y mandatory; scroll-behavior: smooth; scrollbar-width: none; -ms-overflow-style: none; }
 .scroller::-webkit-scrollbar { width: 0; height: 0; }
+.panel-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 14px 24px; }
 .center-hint { height: calc(100% - 60px); display: grid; place-items: center; color: rgba(255,255,255,0.78); }
 .center-hint.bad { color: rgba(254,44,85,0.92); }
 .slide { height: 100%; box-sizing: border-box; scroll-snap-align: start; padding: 18px 14px; display: grid; place-items: center; }

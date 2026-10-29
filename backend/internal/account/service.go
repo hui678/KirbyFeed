@@ -10,20 +10,41 @@ import (
 	"time"
 
 	rediscache "feedsystem_video_go/internal/middleware/redis"
+	"feedsystem_video_go/internal/videocache"
 
 	"github.com/go-sql-driver/mysql"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
+// accountStore 收窄业务层对持久层的依赖：业务规则只依赖这些方法，
+// 这样刷新轮换、重用检测、吊销这些关键路径可以脱离 MySQL 做单元测试。
+type accountStore interface {
+	CreateAccount(ctx context.Context, account *Account) error
+	FindByID(ctx context.Context, id uint) (*Account, error)
+	FindByUsername(ctx context.Context, username string) (*Account, error)
+	Login(ctx context.Context, id uint, token, refreshTokenHash string, refreshExpiry time.Time) error
+	Logout(ctx context.Context, id uint) error
+	ChangePassword(ctx context.Context, id uint, newPassword string) error
+	RenameWithToken(ctx context.Context, id uint, newUsername string, token string) ([]uint, error)
+	UpdateAvatar(ctx context.Context, accountID uint, avatarURL string) error
+	UpdateFields(ctx context.Context, id uint, updates map[string]interface{}) error
+	UpdateToken(ctx context.Context, id uint, token string) error
+	FindByRefreshToken(ctx context.Context, refreshTokenHash string) (*Account, error)
+	RotateRefresh(ctx context.Context, id uint, oldHash, newHash string, rotatedAt time.Time) (bool, error)
+}
+
 type AccountService struct {
-	accountRepository *AccountRepository
+	accountRepository accountStore
 	cache             *rediscache.Client
 }
 
 var (
 	ErrUsernameTaken       = errors.New("username already exists")
 	ErrNewUsernameRequired = errors.New("new_username is required")
+	ErrRefreshInvalid      = errors.New("invalid refresh token")
+	ErrRefreshExpired      = errors.New("refresh token expired")
+	ErrRefreshReuse        = errors.New("refresh token reuse detected")
 )
 
 func NewAccountService(accountRepository *AccountRepository, cache *rediscache.Client) *AccountService {
@@ -52,7 +73,8 @@ func (as *AccountService) Rename(ctx context.Context, accountID uint, newUsernam
 		return "", err
 	}
 
-	if err := as.accountRepository.RenameWithToken(ctx, accountID, newUsername, token); err != nil {
+	videoIDs, err := as.accountRepository.RenameWithToken(ctx, accountID, newUsername, token)
+	if err != nil {
 		var mysqlErr *mysql.MySQLError
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
 			return "", ErrUsernameTaken
@@ -64,6 +86,18 @@ func (as *AccountService) Rename(ctx context.Context, accountID uint, newUsernam
 	}
 	// 改名会重签 token（JWT 里带着 username），旧的必须立刻失效
 	as.setCurrentToken(ctx, accountID, token)
+
+	// 事务已提交，再失效实体缓存。缓存里存的是含 username 的整行 JSON，
+	// 不失效的话详情页 / Feed 会继续展示旧名字，直到 TTL 到期。
+	// 失效失败只记日志：DB 已是权威值，缓存最迟一个 EntityTTL 后自然收敛。
+	for _, id := range videoIDs {
+		cacheCtx, cancel := context.WithTimeout(ctx, cacheTimeout)
+		err := videocache.Invalidate(cacheCtx, as.cache, id)
+		cancel()
+		if err != nil {
+			log.Printf("改名后失效视频实体缓存失败: video=%d err=%v", id, err)
+		}
+	}
 	return token, nil
 }
 
@@ -129,27 +163,23 @@ func (as *AccountService) Login(ctx context.Context, username, password string) 
 		return "", "", err
 	}
 	refreshExpiry := time.Now().Add(auth.RefreshTokenTTL)
-	if err := as.accountRepository.Login(ctx, account.ID, accessToken, refreshToken, refreshExpiry); err != nil {
+	refreshHash := auth.HashRefreshToken(refreshToken)
+	if err := as.accountRepository.Login(ctx, account.ID, accessToken, refreshHash, refreshExpiry); err != nil {
 		return "", "", err
 	}
 	if as.cache != nil {
-		cacheCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-		defer cancel()
-
-		// 单会话互踢：上一张 refresh 的反查键必须清掉，不能只靠 TTL 等它过期
-		if account.RefreshToken != "" && account.RefreshToken != refreshToken {
+		// 单会话互踢：上一轮的 refresh 反查键、重放暂存都必须清掉，不能只靠 TTL 等它过期
+		if account.RefreshToken != "" && account.RefreshToken != refreshHash {
 			as.mustClear(ctx, as.cache.Key("refresh:%s", account.RefreshToken))
+		}
+		if account.PrevRefreshToken != "" {
+			as.mustClear(ctx, as.cache.Key("refresh:%s", account.PrevRefreshToken))
+			as.mustClear(ctx, as.cache.Key("refresh:issued:%s", account.PrevRefreshToken))
 		}
 		// 当前生效 token 换成新的；写不进去就把快路径删掉，绝不留旧值。
 		// 这一步做不干净，旧设备就踢不掉（旧值命中 == 旧 token 被判活放行）。
 		as.setCurrentToken(ctx, account.ID, accessToken)
-
-		if err := as.cache.SetBytes(cacheCtx, as.cache.Key("account:%d:refresh", account.ID), []byte(refreshToken), auth.RefreshTokenTTL); err != nil {
-			log.Printf("failed to set refresh cache: %v", err)
-		}
-		if err := as.cache.SetBytes(cacheCtx, as.cache.Key("refresh:%s", refreshToken), []byte(strconv.FormatUint(uint64(account.ID), 10)), auth.RefreshTokenTTL); err != nil {
-			log.Printf("failed to set refresh lookup: %v", err)
-		}
+		as.setRefreshCache(ctx, account.ID, refreshHash, auth.RefreshTokenTTL)
 	}
 	return accessToken, refreshToken, nil
 }
@@ -163,6 +193,7 @@ func (as *AccountService) Logout(ctx context.Context, accountID uint) error {
 		// MySQL 已空（重复登出），但 Redis 里可能还残留着上一次清理失败留下的脏值，
 		// 它同样会让旧 token 被判活放行。这里必须再清一次才能提前返回。
 		as.mustClear(ctx, as.accessTokenCacheKey(accountID))
+		as.mustClear(ctx, as.cache.Key("account:%d:refresh", accountID))
 		return nil
 	}
 	return as.revokeTokens(ctx, account)
@@ -239,6 +270,11 @@ func (as *AccountService) revokeTokens(ctx context.Context, account *Account) er
 	as.mustClear(ctx, as.cache.Key("account:%d:refresh", account.ID))
 	if account.RefreshToken != "" {
 		as.mustClear(ctx, as.cache.Key("refresh:%s", account.RefreshToken))
+		as.mustClear(ctx, as.cache.Key("refresh:issued:%s", account.RefreshToken))
+	}
+	if account.PrevRefreshToken != "" {
+		as.mustClear(ctx, as.cache.Key("refresh:%s", account.PrevRefreshToken))
+		as.mustClear(ctx, as.cache.Key("refresh:issued:%s", account.PrevRefreshToken))
 	}
 	return as.accountRepository.Logout(ctx, account.ID)
 }
@@ -261,26 +297,129 @@ func (as *AccountService) UpdateProfile(ctx context.Context, accountID uint, req
 	return as.accountRepository.UpdateFields(ctx, accountID, updates)
 }
 
-// RefreshAccessToken 用 refresh token 换一张新的 access token。
+// RefreshResult 一次刷新换出的凭证。
+// RefreshToken 是明文，只出现在响应里；落库和 Redis 反查键用的都是它的哈希。
+type RefreshResult struct {
+	AccessToken  string
+	RefreshToken string
+	AccountID    uint
+	Username     string
+}
+
+// refreshReuseGrace：轮换后旧 refresh 的宽限期。
+//
+// 宽限期内旧票再次出现，优先解释为「客户端没收到响应 / 并发刷新」，
+// 用同一份新凭证幂等重放，避免弱网把用户踢下线；
+// 超过宽限期再次出现，才判定为泄漏并吊销整个账号。
+//
+// 代价要讲清楚：这 60 秒内，拿到旧票的攻击者也能换到当前凭证。
+// 窗口刻意取短，且旧票本来就和当前票存在同一处（同一客户端存储），边际风险有限。
+const refreshReuseGrace = 60 * time.Second
+
+func refreshCacheTTL(expiry time.Time) time.Duration {
+	ttl := time.Until(expiry)
+	if ttl <= 0 || ttl > auth.RefreshTokenTTL {
+		return auth.RefreshTokenTTL
+	}
+	return ttl
+}
+
+func withinRefreshGrace(rotatedAt time.Time) bool {
+	return !rotatedAt.IsZero() && time.Since(rotatedAt) <= refreshReuseGrace
+}
+
+// setRefreshCache 写 refresh 的两个影子键：
+//   - account:{id}:refresh 值存哈希，登出/改密时对称删除；
+//   - refresh:{hash} 反查 accountID，让刷新走 O(1)。
+func (as *AccountService) setRefreshCache(ctx context.Context, accountID uint, refreshHash string, ttl time.Duration) {
+	if as.cache == nil {
+		return
+	}
+	cacheCtx, cancel := context.WithTimeout(ctx, cacheTimeout)
+	defer cancel()
+	if err := as.cache.SetBytes(cacheCtx, as.cache.Key("account:%d:refresh", accountID), []byte(refreshHash), ttl); err != nil {
+		log.Printf("failed to set refresh cache: %v", err)
+	}
+	if err := as.cache.SetBytes(cacheCtx, as.cache.Key("refresh:%s", refreshHash), []byte(strconv.FormatUint(uint64(accountID), 10)), ttl); err != nil {
+		log.Printf("failed to set refresh lookup: %v", err)
+	}
+}
+
+// stashIssuedRefresh 在宽限期内暂存「刚换出的新 refresh 明文」。
+// 库里只有哈希、无法还原明文，没有这一份就无法对「丢了响应的重试」做到幂等；
+// TTL 与宽限期一致，过期后随 Redis 一起消失。
+func (as *AccountService) stashIssuedRefresh(ctx context.Context, prevHash, rawToken string) {
+	if as.cache == nil {
+		return
+	}
+	cacheCtx, cancel := context.WithTimeout(ctx, cacheTimeout)
+	defer cancel()
+	if err := as.cache.SetBytes(cacheCtx, as.cache.Key("refresh:issued:%s", prevHash), []byte(rawToken), refreshReuseGrace); err != nil {
+		log.Printf("failed to stash issued refresh: %v", err)
+	}
+}
+
+func (as *AccountService) issueAccess(ctx context.Context, account *Account) (string, error) {
+	token, err := auth.GenerateToken(account.ID, account.Username)
+	if err != nil {
+		return "", err
+	}
+	if err := as.accountRepository.UpdateToken(ctx, account.ID, token); err != nil {
+		return "", err
+	}
+	as.setCurrentToken(ctx, account.ID, token)
+	return token, nil
+}
+
+// replayRotated 处理宽限期内的旧 refresh：不再次轮换，直接返回上一次的结果。
+// access 优先复用库里那张（未过期且可解析），避免每次重试都把上一张顶掉。
+func (as *AccountService) replayRotated(ctx context.Context, account *Account, prevHash string) (*RefreshResult, error) {
+	if as.cache == nil {
+		return nil, ErrRefreshInvalid
+	}
+	cacheCtx, cancel := context.WithTimeout(ctx, cacheTimeout)
+	b, err := as.cache.GetBytes(cacheCtx, as.cache.Key("refresh:issued:%s", prevHash))
+	cancel()
+	if err != nil || len(b) == 0 {
+		// 暂存已过期/丢失：无法还原新 refresh，只能让客户端重新登录。
+		return nil, ErrRefreshInvalid
+	}
+
+	access := account.Token
+	if claims, perr := auth.ParseToken(access); access == "" || perr != nil || claims.AccountID != account.ID {
+		var aerr error
+		access, aerr = as.issueAccess(ctx, account)
+		if aerr != nil {
+			return nil, aerr
+		}
+	}
+	return &RefreshResult{
+		AccessToken:  access,
+		RefreshToken: string(b),
+		AccountID:    account.ID,
+		Username:     account.Username,
+	}, nil
+}
+
+// RefreshAccessToken 用 refresh token 换一张新的 access token，并轮换 refresh。
 //
 // 链路：
-//  1. 主路径走 Redis 反查键 refresh:<token> -> accountID（O(1)，且天然带 7 天 TTL）；
-//  2. Redis 未命中 / 不可用时降级 MySQL，走 refresh_token 索引等值查询（旧实现是全表扫描）；
-//  3. 无论走哪条路，最终都以 MySQL 里存的 refresh_token 为准做比对并校验过期时间；
-//  4. 成功后回写 account:<id>，让后续鉴权继续走 Redis 快路径。
-//
-// 已知取舍：不轮换 refresh token（换 access 时原样返回旧 refresh），换取刷新链路简单、
-// 前端无需处理并发刷新的 token 竞态；代价是 refresh 泄漏后在其剩余生命周期内都可用。
-func (as *AccountService) RefreshAccessToken(ctx context.Context, refreshToken string) (string, uint, string, error) {
+//  1. 主路径走 Redis 反查键 refresh:{sha256(token)} -> accountID（O(1)，且带剩余寿命 TTL）；
+//  2. Redis 未命中 / 不可用时降级 MySQL，走 refresh_token / prev_refresh_token 索引；
+//  3. 无论走哪条路，最终都以 MySQL 里存的值（哈希）为准做比对并校验过期时间；
+//  4. 命中当前票 → CAS 轮换；命中上一张 → 宽限期内幂等重放，宽限期外按泄漏吊销；
+//  5. 成功后回写 account:{id}，让后续鉴权继续走 Redis 快路径。
+func (as *AccountService) RefreshAccessToken(ctx context.Context, refreshToken string) (*RefreshResult, error) {
 	if refreshToken == "" {
-		return "", 0, "", errors.New("refresh token is empty")
+		return nil, ErrRefreshInvalid
 	}
+	presented := auth.HashRefreshToken(refreshToken)
 
 	// 1) Redis 主路径：反查键直接给出 accountID
 	var account *Account
 	if as.cache != nil {
 		cacheCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-		b, err := as.cache.GetBytes(cacheCtx, as.cache.Key("refresh:%s", refreshToken))
+		b, err := as.cache.GetBytes(cacheCtx, as.cache.Key("refresh:%s", presented))
 		cancel()
 		if err == nil {
 			if id, parseErr := strconv.ParseUint(string(b), 10, 64); parseErr == nil && id != 0 {
@@ -291,35 +430,71 @@ func (as *AccountService) RefreshAccessToken(ctx context.Context, refreshToken s
 		}
 	}
 
-	// 2) Redis 不可用/未命中：降级 MySQL 索引查询
+	// 2) Redis 不可用/未命中：降级 MySQL 索引查询（同时匹配 current 与 prev）
 	if account == nil {
-		acc, err := as.accountRepository.FindByRefreshToken(ctx, refreshToken)
+		acc, err := as.accountRepository.FindByRefreshToken(ctx, presented)
 		if err != nil {
-			return "", 0, "", errors.New("invalid refresh token")
+			return nil, ErrRefreshInvalid
 		}
 		account = acc
 	}
-
-	// 3) 以 MySQL 为权威做比对 + 校验过期时间
-	//    （Redis 只是加速，不是信任源：登出/改密/互踢都要靠这一步兜底）
-	if account.RefreshToken == "" || account.RefreshToken != refreshToken {
-		return "", 0, "", errors.New("invalid refresh token")
-	}
-	if account.RefreshTokenExpiry.IsZero() || time.Now().After(account.RefreshTokenExpiry) {
-		return "", 0, "", errors.New("refresh token expired")
+	if account.RefreshToken == "" {
+		return nil, ErrRefreshInvalid
 	}
 
-	newToken, err := auth.GenerateToken(account.ID, account.Username)
-	if err != nil {
-		return "", 0, "", err
-	}
-	if err := as.accountRepository.UpdateToken(ctx, account.ID, newToken); err != nil {
-		return "", 0, "", err
-	}
+	switch presented {
+	case account.RefreshToken:
+		if account.RefreshTokenExpiry.IsZero() || time.Now().After(account.RefreshTokenExpiry) {
+			return nil, ErrRefreshExpired
+		}
 
-	// 4) 回写快路径缓存（旧实现的 MySQL 降级分支漏了这一步，
-	//    导致降级成功后每个请求都要回源 DB 校验 access token）
-	as.setCurrentToken(ctx, account.ID, newToken)
+		newRaw, err := auth.GenerateRefreshToken(account.ID)
+		if err != nil {
+			return nil, err
+		}
+		newHash := auth.HashRefreshToken(newRaw)
+		rotated, err := as.accountRepository.RotateRefresh(ctx, account.ID, presented, newHash, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		if !rotated {
+			// 并发刷新：另一个请求刚把这张票换掉，重读后确认是否「刚刚发生的轮换」。
+			fresh, ferr := as.accountRepository.FindByID(ctx, account.ID)
+			if ferr == nil && fresh.PrevRefreshToken == presented && withinRefreshGrace(fresh.RefreshRotatedAt) {
+				return as.replayRotated(ctx, fresh, presented)
+			}
+			return nil, ErrRefreshInvalid
+		}
 
-	return newToken, account.ID, account.Username, nil
+		access, err := as.issueAccess(ctx, account)
+		if err != nil {
+			return nil, err
+		}
+		ttl := refreshCacheTTL(account.RefreshTokenExpiry)
+		as.mustClear(ctx, as.cache.Key("refresh:%s", presented))
+		as.setRefreshCache(ctx, account.ID, newHash, ttl)
+		as.stashIssuedRefresh(ctx, presented, newRaw)
+		return &RefreshResult{
+			AccessToken:  access,
+			RefreshToken: newRaw,
+			AccountID:    account.ID,
+			Username:     account.Username,
+		}, nil
+
+	case account.PrevRefreshToken:
+		if withinRefreshGrace(account.RefreshRotatedAt) {
+			return as.replayRotated(ctx, account, presented)
+		}
+		// 重用检测：旧 refresh 在宽限期外再次出现，按泄漏处理 —— 整个账号的凭证全部作废。
+		log.Printf("SECURITY: refresh token reuse detected for account %d; revoking all tokens", account.ID)
+		if err := as.revokeTokens(ctx, account); err != nil {
+			return nil, err
+		}
+		as.mustClear(ctx, as.cache.Key("refresh:%s", presented))
+		as.mustClear(ctx, as.cache.Key("refresh:issued:%s", presented))
+		return nil, ErrRefreshReuse
+
+	default:
+		return nil, ErrRefreshInvalid
+	}
 }

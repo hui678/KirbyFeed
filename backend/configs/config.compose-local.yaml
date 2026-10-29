@@ -25,3 +25,14 @@ observability:
     enabled: true
     api_addr: localhost:6060
     worker_addr: localhost:6061
+
+# 对象存储（默认关闭 → 回落本地磁盘）。compose 里若要接 OSS，用环境变量注入凭证即可。
+object_storage:
+  enabled: false
+  provider: oss
+  endpoint: ""
+  bucket: ""
+  region: ""
+  access_key: ""
+  secret_key: ""
+  presign_ttl_seconds: 3600

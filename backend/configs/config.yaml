@@ -25,3 +25,17 @@ observability:
     enabled: true
     api_addr: localhost:6060
     worker_addr: localhost:6061
+
+# 对象存储（默认关闭 → 回落本地磁盘 .run/uploads，行为同改造前）。
+# 启用阿里云 OSS 后，视频/封面/头像与分片上传都走 OSS，读取用私有桶预签名 URL。
+# 也可用环境变量覆盖：OBJECT_STORAGE_ENABLED / OSS_ENDPOINT / OSS_BUCKET /
+# OSS_ACCESS_KEY / OSS_SECRET_KEY / OSS_REGION / OSS_PRESIGN_TTL
+object_storage:
+  enabled: false
+  provider: oss
+  endpoint: ""
+  bucket: ""
+  region: ""
+  access_key: ""
+  secret_key: ""
+  presign_ttl_seconds: 3600

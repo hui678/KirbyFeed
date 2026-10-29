@@ -46,7 +46,8 @@ Infra 域:   outbox_msgs
 | `id` | 用户唯一 ID |
 | `username` | 用户名，`gorm:"unique"` 唯一索引，登录和注册都按它查 |
 | `password` | 密码，`json:"-"` 序列化时丢弃，任何接口都不会泄到前端 |
-| `token` / `refresh_token` | 登录态令牌，同样 `json:"-"`，持久化在库里用于刷新校验 |
+| `token` / `refresh_token` | 登录态令牌，同样 `json:"-"`；`token` 存 access 原值，`refresh_token` 存 **SHA-256**，另配 `prev_refresh_token`（上一张哈希）与 `refresh_rotated_at`（轮换时间） |
+| `refresh_token_expiry` | refresh 的绝对过期时间，Redis 全挂时由它兜底 |
 | `avatar_url` / `bio` | 头像地址、个人简介 |
 
 业务场景：注册、登录、改密码、个人主页。
@@ -65,7 +66,7 @@ Infra 域:   outbox_msgs
 | `title` / `description` | 标题、描述 |
 | `play_url` / `cover_url` | 播放地址、封面图地址 |
 | `create_time` | 发布时间，服务"最新视频流"排序 |
-| `likes_count` | 点赞总数，**同步更新**，服务"点赞榜" |
+| `likes_count` | 点赞总数，**同步更新**，用于展示点赞数与写热度事件 |
 | `popularity` | 热度分，**异步更新**，服务"热门榜" |
 
 ### 2.3 likes —— 点赞记录表
@@ -156,13 +157,12 @@ Event-driven 的关键，不是业务表。
 
 ## 3. 索引为什么这么设计
 
-`videos` 表的 4 个索引，**每一个对应 feed 模块的一条真实排序查询**（见 `backend/internal/feed/repo.go`）：
+`videos` 表的 3 个索引，**每一个对应 feed 模块的一条真实排序查询**（见 `backend/internal/feed/repo.go`）：
 
 | 索引 | 列 | 服务的查询 |
 |---|---|---|
 | `index`（author_id 单列） | `author_id` | 个人主页"TA 的作品"列表 |
 | `idx_videos_create_time` | `(create_time DESC)` | 最新视频流 `ORDER BY create_time DESC` |
-| `idx_videos_likes_count_id` | `(likes_count DESC)` | 点赞榜：`ORDER BY likes_count DESC, id DESC`，游标 `(likes_count, id)` |
 | `idx_videos_popularity_time_id` | `(popularity DESC, create_time DESC)` | 热门榜 DB 兜底：同序 keyset 分页 |
 
 核心规律：**复合索引的列顺序 = ORDER BY 的列顺序**。热门榜的 keyset 条件：
@@ -175,7 +175,7 @@ Event-driven 的关键，不是业务表。
 
 已知小瑕疵：索引名里有 `_id`，但定义里**并没有把 `id` 列加进去**，keyset 第三层 `id < ?` 不在索引内，极端同分情况下要回表排序。不影响正确性，只影响同分数据多时的性能。
 
-## 4. Popularity 和 LikesCount 的区别
+## 4. Popularity 和 likes_count 的区别
 
 两者都是 `videos` 表上的计数器列，但**语义、写入路径、服务的查询完全不同**：
 
@@ -184,7 +184,7 @@ Event-driven 的关键，不是业务表。
 | 语义 | 纯点赞数 | 综合热度分（点赞 +1、评论 +1 都加分） |
 | 写入方式 | **同步**，点赞事务里 `likes_count + 1`；取消用 `GREATEST(likes_count - 1, 0)` 防负数（见 `like_service.go`） | **异步**，PopularityWorker 消费 MQ 事件后更新 |
 | 存储 | 只有 MySQL 一列 | **双层**：Redis 分钟窗口 ZSET（`hot:video:1m:{yyyyMMddHHmm}`，见 `popularity_cache.go`）+ MySQL 列兜底 |
-| 服务的榜 | 点赞榜（精确计数，keyset 分页） | 热门榜（读 Redis 窗口合并快照，Redis 挂了降级到 MySQL） |
+| 服务的榜 | 无独立榜单，仅展示点赞数 | 热门榜（读 Redis 窗口合并快照，Redis 挂了降级到 MySQL） |
 
 为什么这样拆：`likes_count` 是**事实数据**，必须精确、强一致，走同步事务；`popularity` 是**派生的排序信号**，允许秒级延迟，走异步事件 + Redis 窗口——热榜读 QPS 最高，用 Redis 扛住，MySQL 只做降级兜底。这正是"同步链路 vs 异步链路"分离在数据模型上的体现。
 
@@ -221,7 +221,7 @@ Event-driven 的关键，不是业务表。
 
 - [ ] 10 张表分别是什么？哪些 entity 文件不是表？
 - [ ] `likes` 和 `socials` 的联合唯一索引各防什么？
-- [ ] `videos` 表 4 个索引分别服务哪条查询？
+- [ ] `videos` 表 3 个索引分别服务哪条查询？
 - [ ] `popularity` 和 `likes_count` 在语义、写入路径、存储层上的三点区别？
 - [ ] `outbox_msgs` 解决什么问题？为什么它和业务写入要在同一事务？
 - [ ] 为什么 `notifications.sender_id` 没有索引？

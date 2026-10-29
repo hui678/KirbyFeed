@@ -3,6 +3,7 @@ package auth
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"log"
@@ -99,6 +100,13 @@ func GenerateRefreshToken(accountID uint) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// HashRefreshToken 把 refresh token 的明文压成落库形态（SHA-256 hex，64 字符）。
+// 落库只存哈希：库泄漏时攻击者拿不到可直接使用的凭证；哈希列仍可建索引做等值查询。
+func HashRefreshToken(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
 }
 
 func ParseToken(tokenString string) (*Claims, error) {

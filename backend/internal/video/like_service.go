@@ -39,29 +39,22 @@ func (s *LikeService) Like(ctx context.Context, like *Like) error {
 		}
 	}
 
-	isLiked, err := s.repo.IsLiked(ctx, like.VideoID, like.AccountID)
-	if err != nil {
-		return err
-	}
-	if isLiked {
-		return errors.New("user has liked this video")
-	}
+	// 不再做 IsLiked 预判：接口按「把状态设为已点赞」设计，重复点击直接成功。
+	// 预判是读后写，挡不住并发，却会把「重复点击」变成 500；真正的幂等由消费端
+	// 的 event_id 台账 + 唯一索引保证。
+	//
+	// 两个 event_id 都在发布前生成：MQ 与降级直写必须共用同一个，
+	// 否则 confirm 超时窗口会让两条路径各生效一次。
+	likeEventID, _ := rabbitmq.NewEventID()
+	popEventID, _ := rabbitmq.NewEventID()
 
 	// 落库事件：LikeWorker 消费，负责 likes 行 + videos.likes_count/popularity。
 	// 热度事件：PopularityWorker 消费，只写 Redis 分钟桶。
 	// 两条消息互不依赖：Redis 挂了照样能落库，MySQL 慢了也不会拖住热度。
-	// 热度事件的幂等键：**发布前生成，MQ 与降级路径共用同一个**。
-	//
-	// 为什么不能用 PopularityMQ 内部生成的：存在「publish 成功但 confirm 超时」这个
-	// 无法消除的窗口 —— 消息其实已经在队列里了，消费端迟早会处理一次；而服务层以为
-	// 发布失败，又走降级直写一次。两条路径各加一遍，Redis 热度就翻倍了，
-	// 而 MySQL 侧的 popularity 有 likes 表唯一索引保护只加一遍，两边直接对不上。
-	popEventID, _ := rabbitmq.NewEventID()
-
 	mysqlEnqueued := false
 	redisEnqueued := false
 	if s.likeMQ != nil {
-		if err := s.likeMQ.Like(ctx, like.AccountID, like.VideoID); err == nil {
+		if err := s.likeMQ.Like(ctx, like.AccountID, like.VideoID, likeEventID); err == nil {
 			mysqlEnqueued = true
 		}
 	}
@@ -77,11 +70,11 @@ func (s *LikeService) Like(ctx context.Context, like *Like) error {
 	// 降级：MQ 发布失败（连接断开 / broker nack / confirm 超时）时事务直写 MySQL，
 	// 用户的这一次操作不能因为中间件挂了就丢掉。
 	//
-	// 这里刻意复用消费端同一个 ApplyLike：同一个事务、同一套 INSERT IGNORE 幂等。
+	// 这里刻意复用消费端同一个 ApplyLike：同一个事务、同一套 event_id + 唯一索引幂等。
 	// 因为存在「publish 成功但 confirm 超时」这个无法消除的窗口 —— 消息其实已经在
 	// 队列里了，worker 可能已经写完，此时降级再写一次必须是幂等的，否则计数会多加。
 	if !mysqlEnqueued {
-		if err := s.repo.ApplyLike(ctx, like.VideoID, like.AccountID); err != nil {
+		if err := s.repo.ApplyLike(ctx, like.VideoID, like.AccountID, likeEventID); err != nil {
 			return err
 		}
 	}
@@ -114,21 +107,16 @@ func (s *LikeService) Unlike(ctx context.Context, like *Like) error {
 		}
 	}
 
-	isLiked, err := s.repo.IsLiked(ctx, like.VideoID, like.AccountID)
-	if err != nil {
-		return err
-	}
-	if !isLiked {
-		return errors.New("user has not liked this video")
-	}
-
-	// 同 Like：热度事件在发布前生成幂等键，MQ 与降级路径共用。
+	// 与 Like 对称：不做 IsLiked 预判。即使当前没点赞，取消操作也直接成功
+	// （目标状态已达成），并且仍然发一条 unlike 事件 —— 这样「点赞消息还在队列里、
+	// 用户已经取消」时，后到的 unlike 能把状态纠正回来。
+	likeEventID, _ := rabbitmq.NewEventID()
 	popEventID, _ := rabbitmq.NewEventID()
 
 	mysqlEnqueued := false
 	redisEnqueued := false
 	if s.likeMQ != nil {
-		if err := s.likeMQ.Unlike(ctx, like.AccountID, like.VideoID); err == nil {
+		if err := s.likeMQ.Unlike(ctx, like.AccountID, like.VideoID, likeEventID); err == nil {
 			mysqlEnqueued = true
 		}
 	}
@@ -142,10 +130,10 @@ func (s *LikeService) Unlike(ctx context.Context, like *Like) error {
 	}
 
 	// 降级：与 Like 对称，复用消费端同一个幂等事务入口。
-	// RowsAffected=0（说明 worker 已经删过了）视为成功，不再报「未点赞」，
+	// event_id 重投或事件本来就没生效时，ApplyUnlike 都是空操作，不报「未点赞」，
 	// 因为用户的目标状态（未点赞）已经达成。
 	if !mysqlEnqueued {
-		if err := s.repo.ApplyUnlike(ctx, like.VideoID, like.AccountID); err != nil {
+		if err := s.repo.ApplyUnlike(ctx, like.VideoID, like.AccountID, likeEventID); err != nil {
 			return err
 		}
 	}

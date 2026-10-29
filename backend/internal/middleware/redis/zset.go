@@ -22,6 +22,18 @@ func (c *Client) ZAdd(ctx context.Context, key string, members ...redis.Z) error
 	return c.rdb.ZAdd(ctx, key, members...).Err()
 }
 
+// ZRem 删除若干 member，不存在时返回 nil（幂等）。
+func (c *Client) ZRem(ctx context.Context, key string, members ...string) error {
+	if c == nil || c.rdb == nil || len(members) == 0 {
+		return nil
+	}
+	args := make([]interface{}, len(members))
+	for i, member := range members {
+		args[i] = member
+	}
+	return c.rdb.ZRem(ctx, key, args...).Err()
+}
+
 func (c *Client) ZRemRangeByRank(ctx context.Context, key string, start int64, stop int64) error {
 	if c == nil || c.rdb == nil {
 		return nil
@@ -53,14 +65,6 @@ func (c *Client) ZUnionStore(ctx context.Context, dst string, keys []string, agg
 	}).Err()
 }
 
-func (c *Client) Exists(ctx context.Context, key string) (bool, error) {
-	if c == nil || c.rdb == nil {
-		return false, nil
-	}
-	n, err := c.rdb.Exists(ctx, key).Result()
-	return n > 0, err
-}
-
 func (c *Client) ZRevRange(ctx context.Context, key string, start, stop int64) ([]string, error) {
 	if c == nil || c.rdb == nil {
 		return nil, nil
@@ -86,6 +90,14 @@ func (c *Client) ZCount(ctx context.Context, key string, min, max string) (int64
 		return 0, errors.New("redis client not initialized")
 	}
 	return c.rdb.ZCount(ctx, key, min, max).Result()
+}
+
+// ZCard 返回集合基数。key 不存在时返回 0 且不报错，用来区分「空窗口」和「读取失败」。
+func (c *Client) ZCard(ctx context.Context, key string) (int64, error) {
+	if c == nil || c.rdb == nil {
+		return 0, errors.New("redis client not initialized")
+	}
+	return c.rdb.ZCard(ctx, key).Result()
 }
 
 // ZRevRangeByScoreWithScores 与 ZRevRangeByScore 相同，但一并返回 score。

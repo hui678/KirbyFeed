@@ -24,6 +24,8 @@ func NewPprofMux() *http.ServeMux {
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	// 指标与 pprof 共用内部端口：不额外监听、不暴露到业务端口。
+	mux.Handle("/metrics", Handler())
 
 	return mux
 }

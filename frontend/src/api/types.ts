@@ -67,9 +67,18 @@ export type ListLatestResponse = {
   has_more: boolean
 }
 
-export type ListLikesCountResponse = {
+export type TagSummary = {
+  name: string
+  video_count: number
+}
+
+export type ListTagsResponse = {
+  tags: TagSummary[]
+}
+
+export type ListByTagResponse = {
   video_list: FeedVideoItem[]
-  next_likes_count_before?: number
+  next_time: number
   next_id_before?: number
   has_more: boolean
 }
@@ -79,6 +88,10 @@ export type ListByPopularityResponse = {
   as_of: number
   next_offset: number
   has_more: boolean
+  // 来自 MySQL 累计热度榜（Redis 不可用），不是窗口热榜
+  degraded?: boolean
+  // as_of 已滑出可翻页窗口，需要从第一页重新开始
+  expired?: boolean
   next_latest_popularity?: number
   next_latest_before?: string
   next_latest_id_before?: number

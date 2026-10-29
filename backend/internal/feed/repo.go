@@ -45,25 +45,6 @@ func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, cursor *T
 	return videos, nil
 }
 
-func (repo *FeedRepository) ListLikesCountWithCursor(ctx context.Context, limit int, cursor *LikesCountCursor) ([]*video.Video, error) {
-	var videos []*video.Video
-	query := repo.db.WithContext(ctx).Model(&video.Video{}).
-		Order("likes_count DESC, id DESC")
-
-	if cursor != nil {
-		query = query.Where(
-			"(likes_count < ?) OR (likes_count = ? AND id < ?)",
-			cursor.LikesCount,
-			cursor.LikesCount, cursor.ID,
-		)
-	}
-
-	if err := query.Limit(limit).Find(&videos).Error; err != nil {
-		return nil, err
-	}
-	return videos, nil
-}
-
 // ListByFollowing 与 ListLatest 共用同一套复合游标语义，理由见 ListLatest 注释。
 func (repo *FeedRepository) ListByFollowing(ctx context.Context, limit int, viewerAccountID uint, cursor *TimelineCursor) ([]*video.Video, error) {
 	var videos []*video.Video
@@ -122,14 +103,44 @@ func (repo *FeedRepository) GetByIDs(ctx context.Context, ids []uint) ([]*video.
 	return videos, nil
 }
 
-func (repo *FeedRepository) ListByTag(ctx context.Context, tagName string, limit int) ([]*video.Video, error) {
+// ListTags 返回视频数最多的标签，供话题流顶部标签栏使用。
+// 只统计仍然存在的视频：videos 是硬删除，但 video_tags 不会级联删除，
+// 不 JOIN videos 会把已删除视频的标签也统计进去。
+func (repo *FeedRepository) ListTags(ctx context.Context, limit int) ([]TagSummary, error) {
+	var tags []TagSummary
+	err := repo.db.WithContext(ctx).
+		Table("tags").
+		Select("tags.name AS name, COUNT(video_tags.video_id) AS video_count").
+		Joins("JOIN video_tags ON video_tags.tag_id = tags.id").
+		Joins("JOIN videos ON videos.id = video_tags.video_id").
+		Group("tags.id, tags.name").
+		Order("video_count DESC, tags.name ASC").
+		Limit(limit).
+		Scan(&tags).Error
+	return tags, err
+}
+
+// ListByTag 与 ListLatest 共用 (create_time DESC, id DESC) 的复合游标语义。
+// Select("videos.*") 是必须的：JOIN 后 tags 表也有 id/name 列，不限定会覆盖视频字段。
+func (repo *FeedRepository) ListByTag(ctx context.Context, tagName string, limit int, cursor *TimelineCursor) ([]*video.Video, error) {
 	var videos []*video.Video
-	err := repo.db.WithContext(ctx).Model(&video.Video{}).Table("videos").
+	query := repo.db.WithContext(ctx).Model(&video.Video{}).Table("videos").
+		Select("videos.*").
 		Joins("JOIN video_tags ON video_tags.video_id = videos.id").
 		Joins("JOIN tags ON tags.id = video_tags.tag_id").
 		Where("tags.name = ?", tagName).
-		Order("videos.create_time desc").
-		Limit(limit).
-		Find(&videos).Error
-	return videos, err
+		Order("videos.create_time DESC, videos.id DESC")
+
+	if cursor != nil {
+		query = query.Where(
+			"(videos.create_time < ?) OR (videos.create_time = ? AND videos.id < ?)",
+			cursor.CreateTime,
+			cursor.CreateTime, cursor.ID,
+		)
+	}
+
+	if err := query.Limit(limit).Find(&videos).Error; err != nil {
+		return nil, err
+	}
+	return videos, nil
 }

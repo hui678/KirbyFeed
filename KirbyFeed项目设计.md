@@ -1,4 +1,4 @@
-# feedsystem_video_go
+# KirbyFeed
 
 > 项目介绍：本项目是一款由 Go + Vue 3 开发的短视频 Feed 流系统，提供账号、视频、点赞、评论、关注（Social）、Feed、私信与通知接口，并通过 Redis、RabbitMQ、分片上传、SSE 与 Docker Compose 提升性能、体验和部署效率。
 
@@ -124,11 +124,11 @@
 | 层级              | 方法/路由                                                    | 输入 -> 输出                                                 | 存储(MySQL/Redis) | 核心说明                                                     |
 | ----------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ----------------- | ------------------------------------------------------------ |
 | Handler           | POST `/feed/listLatest`                                      | `{limit,latest_time}` -> `{videos[], next_time}`             | MySQL ✅ / Redis ✅ | 匿名流可缓存（短 TTL）；`latest_time` 游标分页。             |
-| Handler           | POST `/feed/listLikesCount`                                  | `{limit,likes_count_before,id_before}` -> `{videos[], next_likes_count_before,next_id_before}` | MySQL ✅           | 复合游标分页：`likes_count + id` 保证稳定不重不漏。          |
 | Handler           | POST `/feed/listByPopularity`                                | `{limit,as_of,offset,latest_popularity?,latest_before?,latest_id_before?}` -> `{videos[],as_of,next_offset,next_latest_*}` | Redis ✅ / MySQL ✅ | 热榜优先 Redis ZSET（快照+offset）；Redis 不可用时回退 MySQL 复合游标。 |
 | Handler           | POST `/feed/listByFollowing`                                 | `{limit,latest_time}` -> `{videos[],next_time,has_more}`     | MySQL ✅ / Redis ✅ | 需要登录；按关注关系聚合视频，支持短缓存。                   |
-| Handler           | POST `/feed/listByTag`                                       | `{tag_name,limit}` -> `{video_list}`                         | MySQL ✅           | 按发布时提取的 `#话题` 查询视频。                            |
-| Service(建议命名) | `ListLatest/ListLikesCount/ListByPopularity/ListByFollowing/ListByTag/GetVideoByIDs` | - | - | `ListLatest` 使用 Redis `feed:global_timeline` 热时间线 + MySQL 冷数据拼接；视频实体使用 L1 本地缓存、L2 Redis、L3 MySQL。 |
+| Handler           | POST `/feed/listTags`                                        | `{limit}` -> `{tags[{name,video_count}]}`                    | MySQL ✅ | 热门话题：按视频数倒序，供话题页标签栏使用。                 |
+| Handler           | POST `/feed/listByTag`                                       | `{tag_name,limit,latest_time?,latest_id_before?}` -> `{video_list[],next_time,next_id_before,has_more}` | MySQL ✅ | 按 `#话题` 查询；`create_time + id` 复合游标分页。 |
+| Service(建议命名) | `ListLatest/ListByPopularity/ListByFollowing/ListTags/ListByTag/GetVideoByIDs` | - | - | `ListLatest` 使用 Redis `feed:global_timeline` 热时间线 + MySQL 冷数据拼接；视频实体使用 L1 本地缓存、L2 Redis、L3 MySQL。 |
 
 ### 私信系统
 
@@ -222,7 +222,7 @@
 | 上传体验   | 分片上传与断点续传          | 前端按 5MB 分片上传，计算文件 MD5 与分片 MD5；后端 Redis 记录会话与已上传分片，完成后合并并清理临时文件。 | 大文件上传失败后可复用已上传分片，降低重传成本。              |
 | 内容组织   | #话题标签                   | 发布视频时从标题与描述中提取 `#tag`，写入 `tags` 与 `video_tags`；Feed 提供 `/feed/listByTag` 查询。 | 支持按话题聚合内容，扩展搜索、推荐与运营入口。                |
 | 实时互动   | SSE 通知推送                | 点赞、评论、关注事件经 `NotificationWorker` 写入 `notifications` 表并推送给在线用户；接口支持列表、未读计数、已读标记。 | 用户能实时感知互动事件，离线后仍可查看历史通知。              |
-| 分页设计   | 双字段复合游标分页          | `/feed/listLikesCount` 使用 `likes_count_before + id_before` 作为复合游标（两者一起定位下一页）。 | 解决“点赞数相同”排序不稳定问题，确保不重复、不漏数据，分页稳定可复现。 |
+| 分页设计   | 双字段复合游标分页          | `/feed/listLatest` 与 `/feed/listByTag` 使用 `create_time + id` 作为复合游标（时间相同再用 id 定位）。 | 解决同一毫秒发布多条视频时游标不唯一的问题，确保不重复、不漏数据。 |
 | 分页设计   | 快照式稳定分页              | `/feed/listByPopularity` 首次请求生成 `as_of`（分钟级快照版本），后续分页携带相同 `as_of + offset`。 | 规避热度实时变化导致的“跳页/重复/缺失”，滚动浏览更稳定。     |
 | 安全鉴权   | 软硬鉴权兼容模式            | 提供 `JWTAuth`（强制拦截）与 `SoftJWTAuth`（可不带 token；带了必须合法，否则 401）。 | 既支持匿名浏览 Feed，又支持登录态个性化（如点赞/关注状态），体验与安全兼顾。 |
 | 安全稳定   | Redis 限流                  | 使用 `INCR + PEXPIRE` 原子脚本实现窗口限流，覆盖登录、注册、点赞、评论、关注写接口。 | 降低暴力登录、刷赞、刷评论、频繁关注对系统的冲击。            |

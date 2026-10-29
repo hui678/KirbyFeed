@@ -44,24 +44,6 @@ type ListLatestResponse struct {
 	HasMore      bool            `json:"has_more"`
 }
 
-type ListLikesCountRequest struct {
-	Limit            int    `json:"limit"`
-	LikesCountBefore *int64 `json:"likes_count_before,omitempty"`
-	IDBefore         *uint  `json:"id_before,omitempty"`
-}
-
-type LikesCountCursor struct {
-	LikesCount int64
-	ID         uint
-}
-
-type ListLikesCountResponse struct {
-	VideoList            []FeedVideoItem `json:"video_list"`
-	NextLikesCountBefore *int64          `json:"next_likes_count_before,omitempty"`
-	NextIDBefore         *uint           `json:"next_id_before,omitempty"`
-	HasMore              bool            `json:"has_more"`
-}
-
 type ListByFollowingRequest struct {
 	Limit          int   `json:"limit"`
 	LatestTime     int64 `json:"latest_time"`
@@ -81,6 +63,10 @@ type ListByPopularityRequest struct {
 	Offset         int   `json:"offset"` // 下一页从这里开始；第一页传0
 	LatestIDBefore *uint `json:"latest_id_before,omitempty"`
 
+	// ForceDB 让「已经降级的分页会话」继续留在 MySQL 累计热度排序上。
+	// Redis 中途恢复时不能悄悄切回窗口榜，否则同一会话会拼两套排序。
+	ForceDB bool `json:"force_db,omitempty"`
+
 	// DB fallback 用（可选）
 	LatestPopularity int64     `json:"latest_popularity"`
 	LatestBefore     time.Time `json:"latest_before"`
@@ -92,7 +78,40 @@ type ListByPopularityResponse struct {
 	NextOffset int             `json:"next_offset"`
 	HasMore    bool            `json:"has_more"`
 
+	// Degraded 表示本次结果来自 MySQL 累计热度榜（Redis 不可用），
+	// 与窗口热榜是两套排序语义，客户端应提示并保持同一套排序翻页。
+	Degraded bool `json:"degraded,omitempty"`
+	// Expired 表示客户端带来的 as_of 已滑出可翻页窗口，需要从第一页重新开始。
+	Expired bool `json:"expired,omitempty"`
+
 	NextLatestPopularity *int64     `json:"next_latest_popularity,omitempty"`
 	NextLatestBefore     *time.Time `json:"next_latest_before,omitempty"`
 	NextLatestIDBefore   *uint      `json:"next_latest_id_before,omitempty"`
+}
+
+type TagSummary struct {
+	Name       string `json:"name"`
+	VideoCount int64  `json:"video_count"`
+}
+
+type ListTagsRequest struct {
+	Limit int `json:"limit"`
+}
+
+type ListTagsResponse struct {
+	Tags []TagSummary `json:"tags"`
+}
+
+type ListByTagRequest struct {
+	TagName        string `json:"tag_name"`
+	Limit          int    `json:"limit"`
+	LatestTime     int64  `json:"latest_time"`
+	LatestIDBefore *uint  `json:"latest_id_before,omitempty"`
+}
+
+type ListByTagResponse struct {
+	VideoList    []FeedVideoItem `json:"video_list"`
+	NextTime     int64           `json:"next_time"`
+	NextIDBefore *uint           `json:"next_id_before,omitempty"`
+	HasMore      bool            `json:"has_more"`
 }

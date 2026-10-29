@@ -3,9 +3,11 @@ package video
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	rediscache "feedsystem_video_go/internal/middleware/redis"
+	"feedsystem_video_go/internal/videocache"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -19,51 +21,98 @@ const singleRedisOpTimeout = 50 * time.Millisecond
 // VideoEntityTTL 视频实体缓存过期时间。
 // 详情页读取与 Feed 批量读取共用同一份实体缓存（video:entity:<id>），
 // 两者必须共用同一个 key 构造方式与同一个 TTL，否则同一份数据会出现两份副本。
-const VideoEntityTTL = time.Hour
+const VideoEntityTTL = videocache.EntityTTL
 
 // VideoEntityKey 返回视频实体缓存的 key。
 func VideoEntityKey(cache *rediscache.Client, id uint) string {
-	return cache.Key("video:entity:%d", id)
+	return videocache.EntityKey(cache, id)
 }
 
-// VideoEntityNullSentinel 是「这个 videoID 确实不存在」的占位值。
-//
-// 为什么需要：L3 查不到时如果什么都不记，同一个不存在的 ID 每次请求都会打
-// 一次 MySQL —— 这就是**缓存穿透**。写入这个哨兵后，后续请求在 L2 就能判定
-// 「确定不存在」，不再回源。
-//
-// 为什么不是 JSON 的 "null"：json.Unmarshal([]byte("null"), &v) 不报错，
-// 只会把 v 留成零值 —— 那会缓存出一个 ID=0 的垃圾实体。所以哨兵必须取一个
-// 非法 JSON，并且必须在尝试解析之前显式识别（见 IsVideoEntityNull）。
-const VideoEntityNullSentinel = "__null__"
+// VideoEntityVersionKey 返回实体缓存的失效版本号 key。
+// Feed 的批量读取会把这些 key 一次 MGET 出来，作为回写 CAS 的比较基准。
+func VideoEntityVersionKey(cache *rediscache.Client, id uint) string {
+	return videocache.VersionKey(cache, id)
+}
+
+// VideoEntityNullSentinel 是「这个 videoID 确实不存在」的占位值，详见 videocache 包。
+const VideoEntityNullSentinel = videocache.NullSentinel
 
 // VideoEntityNullTTL 占位值的 TTL，故意取短：万一数据后来真的补上了，最多
 // 延迟这么久就能读到。这也是它相对布隆过滤器的优势 —— 后者不支持删除，
 // 已失效的 ID 会永久残留、让误判率持续上升。
-const VideoEntityNullTTL = 60 * time.Second
+const VideoEntityNullTTL = videocache.NullTTL
 
 // IsVideoEntityNull 判断缓存里取到的值是不是「确定不存在」的占位值。
 // 必须在 json.Unmarshal 之前调用：哨兵是非法 JSON，不先识别就会退化成普通 miss。
 func IsVideoEntityNull(s string) bool {
-	return s == VideoEntityNullSentinel
+	return videocache.IsNull(s)
 }
 
 // SetVideoEntityNull 写入「这个 videoID 确定不存在」的占位值，nil 安全。
 func SetVideoEntityNull(ctx context.Context, cache *rediscache.Client, id uint) {
-	if cache == nil || id == 0 {
-		return
+	videocache.SetNull(ctx, cache, id)
+}
+
+// InvalidateVideoEntity 失效视频实体缓存：DEL 实体 + 版本号 +1（原子）。
+// 版本号递增是 Q14 那道「旧值迟到回填」的解法，详见 videocache.Invalidate。
+func InvalidateVideoEntity(ctx context.Context, cache *rediscache.Client, id uint) {
+	if err := videocache.Invalidate(ctx, cache, id); err != nil {
+		log.Printf("invalidate video entity failed (video=%d): %v", id, err)
+	}
+}
+
+// EntityVersion 读取实体当前的失效版本号。
+// 第二个返回值 false 表示 Redis 不可用或读失败 —— 此时不应回写缓存，
+// 因为 CAS 的比较基准不可信。
+func EntityVersion(ctx context.Context, cache *rediscache.Client, id uint) (string, bool) {
+	if cache == nil {
+		return "", false
 	}
 	opCtx, cancel := context.WithTimeout(ctx, singleRedisOpTimeout)
 	defer cancel()
-	_ = cache.SetBytes(opCtx, VideoEntityKey(cache, id), []byte(VideoEntityNullSentinel), VideoEntityNullTTL)
+
+	b, err := cache.GetBytes(opCtx, videocache.VersionKey(cache, id))
+	if err != nil {
+		if rediscache.IsMiss(err) {
+			return "", true // 从未失效过：版本号视为空串
+		}
+		return "", false
+	}
+	return string(b), true
 }
 
-// InvalidateVideoEntity 失效视频实体缓存，nil 安全的空实现。
-func InvalidateVideoEntity(ctx context.Context, cache *rediscache.Client, id uint) {
-	if cache == nil || id == 0 {
-		return
+// SetVideoEntityIfVersion 只有版本号未变时才写入实体。
+// 返回 false 表示期间发生过失效（或写入失败），本次回写被丢弃。
+func SetVideoEntityIfVersion(ctx context.Context, cache *rediscache.Client, id uint, payload []byte, ttl time.Duration, version string) bool {
+	ok, err := videocache.SetIfVersion(ctx, cache, id, payload, ttl, version)
+	if err != nil {
+		log.Printf("write back video entity failed (video=%d): %v", id, err)
+		return false
 	}
-	_ = cache.Del(ctx, VideoEntityKey(cache, id))
+	return ok
+}
+
+// maxPendingEntityWrites 限制进程内同时在途的异步缓存回写数。
+//
+// 每个 L3 miss 都起一个 goroutine 回写，在 Redis 故障时会线性堆积
+// （每个 goroutine 都要等到自己的超时）。有界之后超出的回写直接丢弃：
+// 回写只是加速下一次读，丢了不影响正确性，下一次 miss 会再补。
+const maxPendingEntityWrites = 256
+
+var entityWriteSlots = make(chan struct{}, maxPendingEntityWrites)
+
+// ScheduleEntityWrite 在配额内异步执行一次缓存回写，配额满时丢弃并返回 false。
+func ScheduleEntityWrite(fn func()) bool {
+	select {
+	case entityWriteSlots <- struct{}{}:
+		go func() {
+			defer func() { <-entityWriteSlots }()
+			fn()
+		}()
+		return true
+	default:
+		return false
+	}
 }
 
 // EntityLoadGroup 视频实体回源的进程内去重组。

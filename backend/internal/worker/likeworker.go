@@ -52,9 +52,9 @@ func (w *LikeWorker) process(ctx context.Context, d amqp.Delivery) error {
 
 	switch evt.Action {
 	case "like":
-		return w.likes.ApplyLike(ctx, evt.UserID, evt.VideoID)
+		return w.likes.ApplyLike(ctx, evt.UserID, evt.VideoID, evt.EventID)
 	case "unlike":
-		return w.likes.ApplyUnlike(ctx, evt.UserID, evt.VideoID)
+		return w.likes.ApplyUnlike(ctx, evt.UserID, evt.VideoID, evt.EventID)
 	default:
 		return nil
 	}

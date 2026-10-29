@@ -3,14 +3,22 @@ package account
 import "time"
 
 type Account struct {
-	ID           uint   `gorm:"primaryKey" json:"id"`
-	Username     string `gorm:"unique" json:"username"`
-	Password     string `json:"-"`
-	Token        string `json:"-"`
+	ID       uint   `gorm:"primaryKey" json:"id"`
+	Username string `gorm:"unique" json:"username"`
+	Password string `json:"-"`
+	Token    string `json:"-"`
+	// RefreshToken 存的是 SHA-256(明文) 的 hex，不是明文本身：
+	// 库被拖走时攻击者也拿不到可直接使用的凭证。比对前先把传入值哈希。
 	RefreshToken string `gorm:"size:64;index" json:"-"`
+	// PrevRefreshToken：轮换前的上一张（同样是哈希）。
+	// 它在宽限期内再次出现 = 弱网重试/并发刷新；宽限期外出现 = 疑似泄漏，整账号吊销。
+	PrevRefreshToken string `gorm:"size:64;index" json:"-"`
+	// RefreshRotatedAt：上一次轮换的时间，用来判定宽限期。
+	RefreshRotatedAt time.Time `json:"-"`
 	// RefreshTokenExpiry：refresh token 的绝对过期时间。
 	// 修复要点：旧实现只在 Redis 侧用 TTL 表达「7 天」，MySQL 侧只有裸字符串，
 	// 一旦 Redis 不可用或 key 被淘汰，refresh token 就变成永久有效。
+	// 轮换不会延长这个时间：refresh 的总寿命始终是「签发后 7 天」。
 	RefreshTokenExpiry time.Time `json:"-"`
 	AvatarURL          string    `gorm:"type:varchar(512)" json:"avatar_url,omitempty"`
 	Bio                string    `gorm:"type:varchar(255)" json:"bio,omitempty"`

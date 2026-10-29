@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"feedsystem_video_go/internal/observability"
 	"sync"
 	"time"
 
@@ -69,26 +70,16 @@ func (p *publisher) PublishJSON(ctx context.Context, exchange, routingKey string
 	if p == nil || p.ch == nil {
 		return errors.New("publisher is not initialized")
 	}
-	if exchange == "" || routingKey == "" {
-		return errors.New("exchange and routingKey are required")
-	}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if err := p.ch.PublishWithContext(ctx, exchange, routingKey, false, false, amqp.Publishing{
+	return p.publish(ctx, exchange, routingKey, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		Timestamp:    time.Now(),
 		Body:         b,
-	}); err != nil {
-		return err
-	}
-	return p.waitConfirm(ctx)
+	})
 }
 
 // PublishRaw 直接发布字节流（用于重试：原样搬运 Body，不重新序列化）。
@@ -96,26 +87,38 @@ func (p *publisher) PublishRaw(ctx context.Context, exchange, routingKey string,
 	if p == nil || p.ch == nil {
 		return errors.New("publisher is not initialized")
 	}
-	if exchange == "" || routingKey == "" {
-		return errors.New("exchange and routingKey are required")
-	}
 	if contentType == "" {
 		contentType = "application/json"
 	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if err := p.ch.PublishWithContext(ctx, exchange, routingKey, false, false, amqp.Publishing{
+	return p.publish(ctx, exchange, routingKey, amqp.Publishing{
 		ContentType:  contentType,
 		DeliveryMode: amqp.Persistent,
 		Timestamp:    time.Now(),
 		Headers:      headers,
 		Body:         body,
-	}); err != nil {
+	})
+}
+
+// publish 是两种发布方式的公共实现：校验 → 加锁 → 发布 → 等确认 → 记指标。
+// 指标按 exchange + 结果打标签，用来回答「发布失败率是否在升高」。
+func (p *publisher) publish(ctx context.Context, exchange, routingKey string, msg amqp.Publishing) error {
+	if exchange == "" || routingKey == "" {
+		return errors.New("exchange and routingKey are required")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if err := p.ch.PublishWithContext(ctx, exchange, routingKey, false, false, msg); err != nil {
+		observability.Inc("feedsystem_publish_total", "exchange", exchange, "result", "failure")
 		return err
 	}
-	return p.waitConfirm(ctx)
+	if err := p.waitConfirm(ctx); err != nil {
+		observability.Inc("feedsystem_publish_total", "exchange", exchange, "result", "failure")
+		return err
+	}
+	observability.Inc("feedsystem_publish_total", "exchange", exchange, "result", "success")
+	return nil
 }
 
 func (p *publisher) waitConfirm(ctx context.Context) error {

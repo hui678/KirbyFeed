@@ -15,10 +15,13 @@ type Config struct {
 	Redis               RedisConfig         `yaml:"redis"`
 	RabbitMQ            RabbitMQConfig      `yaml:"rabbitmq"`
 	ObservabilityConfig ObservabilityConfig `yaml:"observability"`
+	ObjectStorage       ObjectStorageConfig `yaml:"object_storage"`
 }
 
 type ServerConfig struct {
 	Port int `yaml:"port"`
+	// AdminToken 用于保护 /admin/outbox/* 运维接口；为空时不注册这些路由。
+	AdminToken string `yaml:"admin_token"`
 }
 
 // 数据库连接池的默认值。
@@ -36,6 +39,12 @@ const (
 	DefaultMaxIdleConns = 16
 
 	DefaultMaxConcurrentDBLoad = DefaultMaxOpenConns / 2
+
+	// Redis 连接池默认值。默认的 10*GOMAXPROCS 在小机器上够用、在大机器上
+	// 会开出远超 Redis 需要的连接；这里显式给出，并按池大小反推排队超时，
+	// 避免缓存抖动时请求在池上无限等待（那时缓存已经从"加速"变成"拖慢"）。
+	DefaultRedisPoolSize     = 64
+	DefaultRedisMinIdleConns = 8
 )
 
 type DatabaseConfig struct {
@@ -67,6 +76,21 @@ type RedisConfig struct {
 	Port     int    `yaml:"port"`
 	Password string `yaml:"password"`
 	DB       int    `yaml:"db"`
+	// PoolSize / MinIdleConns 为 0 时用默认值，见 DefaultRedisPoolSize。
+	PoolSize     int `yaml:"pool_size"`
+	MinIdleConns int `yaml:"min_idle_conns"`
+}
+
+func (c *RedisConfig) Normalize() {
+	if c.PoolSize <= 0 {
+		c.PoolSize = DefaultRedisPoolSize
+	}
+	if c.MinIdleConns < 0 {
+		c.MinIdleConns = 0
+	}
+	if c.MinIdleConns > c.PoolSize {
+		c.MinIdleConns = c.PoolSize
+	}
 }
 
 type RabbitMQConfig struct {
@@ -83,6 +107,32 @@ type PprofConfig struct {
 	Enabled    bool   `yaml:"enabled"`
 	ApiAddr    string `yaml:"api_addr"`
 	WorkerAddr string `yaml:"worker_addr"`
+}
+
+// ObjectStorageConfig 对象存储配置。
+//
+// enabled=false（默认）时回落到本地磁盘，行为与改造前一致。
+// provider 目前仅支持 "oss"（阿里云 OSS）。读取采用「私有桶 + 预签名 URL」，
+// PresignTTL 控制 URL 有效期（秒，默认 3600）。
+type ObjectStorageConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Provider    string `yaml:"provider"`
+	Endpoint    string `yaml:"endpoint"`
+	Bucket      string `yaml:"bucket"`
+	Region      string `yaml:"region"`
+	AccessKey   string `yaml:"access_key"`
+	SecretKey   string `yaml:"secret_key"`
+	PresignTTL  int    `yaml:"presign_ttl_seconds"`
+}
+
+// Normalize 填默认值。
+func (c *ObjectStorageConfig) Normalize() {
+	if c.Provider == "" {
+		c.Provider = "oss"
+	}
+	if c.PresignTTL <= 0 {
+		c.PresignTTL = 3600
+	}
 }
 
 func Load(filename string) (Config, error) {
@@ -108,6 +158,9 @@ func ApplyEnvOverrides(cfg *Config) {
 		if port, err := strconv.Atoi(v); err == nil {
 			cfg.Server.Port = port
 		}
+	}
+	if v := os.Getenv("ADMIN_TOKEN"); v != "" {
+		cfg.Server.AdminToken = v
 	}
 	if v := os.Getenv("MYSQL_HOST"); v != "" {
 		cfg.Database.Host = v
@@ -155,6 +208,16 @@ func ApplyEnvOverrides(cfg *Config) {
 			cfg.Redis.DB = db
 		}
 	}
+	if v := os.Getenv("REDIS_POOL_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Redis.PoolSize = n
+		}
+	}
+	if v := os.Getenv("REDIS_MIN_IDLE_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Redis.MinIdleConns = n
+		}
+	}
 	if v := os.Getenv("RABBITMQ_HOST"); v != "" {
 		cfg.RabbitMQ.Host = v
 	}
@@ -170,8 +233,37 @@ func ApplyEnvOverrides(cfg *Config) {
 		cfg.RabbitMQ.Password = v
 	}
 
+	if v := os.Getenv("OBJECT_STORAGE_ENABLED"); v != "" {
+		cfg.ObjectStorage.Enabled = v == "1" || v == "true" || v == "yes"
+	}
+	if v := os.Getenv("OSS_PROVIDER"); v != "" {
+		cfg.ObjectStorage.Provider = v
+	}
+	if v := os.Getenv("OSS_ENDPOINT"); v != "" {
+		cfg.ObjectStorage.Endpoint = v
+	}
+	if v := os.Getenv("OSS_BUCKET"); v != "" {
+		cfg.ObjectStorage.Bucket = v
+	}
+	if v := os.Getenv("OSS_REGION"); v != "" {
+		cfg.ObjectStorage.Region = v
+	}
+	if v := os.Getenv("OSS_ACCESS_KEY"); v != "" {
+		cfg.ObjectStorage.AccessKey = v
+	}
+	if v := os.Getenv("OSS_SECRET_KEY"); v != "" {
+		cfg.ObjectStorage.SecretKey = v
+	}
+	if v := os.Getenv("OSS_PRESIGN_TTL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.ObjectStorage.PresignTTL = n
+		}
+	}
+
 	// 无论走 YAML 还是默认值，连接池参数都要保证有值（见 DefaultMaxOpenConns 的说明）
 	cfg.Database.Normalize()
+	cfg.Redis.Normalize()
+	cfg.ObjectStorage.Normalize()
 }
 
 // bool用来表示是否使用了默认配置，true表示使用了默认配置

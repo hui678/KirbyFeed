@@ -57,27 +57,33 @@ func (l *LikeMQ) Close() error {
 	return l.p.Close()
 }
 
-func (l *LikeMQ) Like(ctx context.Context, userID, videoID uint) error {
-	return l.publish(ctx, "like", likeLikeRK, userID, videoID)
+// Like / Unlike 的 eventID 由调用方传入：服务层在发布前生成，
+// MQ 路径与降级直写共用同一个，消费端才能用它做重投去重。
+// 为空时这里临时生成一个，保证消息体不为空（消费端会退化为只靠唯一索引去重）。
+func (l *LikeMQ) Like(ctx context.Context, userID, videoID uint, eventID string) error {
+	return l.publish(ctx, "like", likeLikeRK, userID, videoID, eventID)
 }
 
-func (l *LikeMQ) Unlike(ctx context.Context, userID, videoID uint) error {
-	return l.publish(ctx, "unlike", likeUnlikeRK, userID, videoID)
+func (l *LikeMQ) Unlike(ctx context.Context, userID, videoID uint, eventID string) error {
+	return l.publish(ctx, "unlike", likeUnlikeRK, userID, videoID, eventID)
 }
 
-func (l *LikeMQ) publish(ctx context.Context, action, routingKey string, userID, videoID uint) error {
+func (l *LikeMQ) publish(ctx context.Context, action, routingKey string, userID, videoID uint, eventID string) error {
 	if l == nil || l.p == nil {
 		return errors.New("like mq is not initialized")
 	}
 	if userID == 0 || videoID == 0 {
 		return errors.New("userID and videoID are required")
 	}
-	id, err := newEventID(16)
-	if err != nil {
-		return err
+	if eventID == "" {
+		id, err := newEventID(16)
+		if err != nil {
+			return err
+		}
+		eventID = id
 	}
 	event := LikeEvent{
-		EventID:    id,
+		EventID:    eventID,
 		Action:     action,
 		UserID:     userID,
 		VideoID:    videoID,

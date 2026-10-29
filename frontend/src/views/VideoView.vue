@@ -147,12 +147,19 @@ function missingChunkIndices(e: unknown): number[] {
   return raw.filter((i): i is number => Number.isInteger(i) && (i as number) >= 0)
 }
 
+// 整文件 MD5 与 init 声明不一致时，服务端会作废会话（避免客户端对着坏数据无限重试），
+// 此时重传旧 upload_id 只会 404，必须重新 init 走完整流程。
+function isFileHashMismatch(e: unknown): boolean {
+  if (!(e instanceof ApiError) || !e.payload || typeof e.payload !== 'object') return false
+  return (e.payload as { code?: unknown }).code === 'file_hash_mismatch'
+}
+
 function chunkBytes(chunkIndex: number, file: File): number {
   const start = chunkIndex * CHUNK_SIZE
   return Math.min(start + CHUNK_SIZE, file.size) - start
 }
 
-async function uploadVideoChunked(file: File): Promise<videoApi.UploadResponse> {
+async function uploadVideoChunked(file: File, restartRound = 0): Promise<videoApi.UploadResponse> {
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
   // SparkMD5 是同步计算，会占住主线程；先让浏览器把提示画出来再算
   stage.value = '计算文件指纹'
@@ -273,6 +280,13 @@ async function uploadVideoChunked(file: File): Promise<videoApi.UploadResponse> 
       if (e instanceof ApiError && e.status === 409) {
         await sleep(1000 * (attempt + 1))
         continue
+      }
+      // 整文件校验失败：服务端已作废会话并清掉映射，旧 upload_id 再传只会 404。
+      // 重新 init 完整走一遍；只重试一次，避免客户端指纹本身算错时无限循环。
+      if (isFileHashMismatch(e)) {
+        if (restartRound >= 1) throw e
+        stage.value = '文件校验失败，重新上传'
+        return uploadVideoChunked(file, restartRound + 1)
       }
       // 位图声称已传的分片在磁盘上并不存在：把这几片从本地记账里抹掉并立刻补传，
       // 下一轮再合并。少了这一步，这个会话会一直卡到 24h TTL 过期。

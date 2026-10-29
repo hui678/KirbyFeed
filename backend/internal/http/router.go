@@ -9,7 +9,9 @@ import (
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/middleware/ratelimit"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
+	"feedsystem_video_go/internal/observability"
 	"feedsystem_video_go/internal/social"
+	"feedsystem_video_go/internal/storage"
 	"feedsystem_video_go/internal/video"
 	"feedsystem_video_go/internal/worker"
 	"log"
@@ -19,7 +21,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *gin.Engine {
+func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ, adminToken string, store storage.Storage) *gin.Engine {
 	r := gin.Default()
 	if err := r.SetTrustedProxies(nil); err != nil {
 		log.Printf("SetTrustedProxies failed: %v", err)
@@ -31,6 +33,8 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	// rate_limit
 	loginLimiter := ratelimit.Limit(cache, "account_login", 10, time.Minute, ratelimit.KeyByIP)
 	registerLimiter := ratelimit.Limit(cache, "account_register", 5, time.Hour, ratelimit.KeyByIP)
+	// 刷新接口无鉴权头，只能按 IP 限流：防止拿泄露的 refresh 反复试探/刷 access。
+	refreshLimiter := ratelimit.Limit(cache, "account_refresh", 30, time.Minute, ratelimit.KeyByIP)
 
 	likeLimiter := ratelimit.Limit(cache, "like_write", 30, time.Minute, ratelimit.KeyByAccount)
 	commentLimiter := ratelimit.Limit(cache, "comment_write", 10, time.Minute, ratelimit.KeyByAccount)
@@ -41,14 +45,14 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	// account
 	accountRepository := account.NewAccountRepository(db)
 	accountService := account.NewAccountService(accountRepository, cache)
-	accountHandler := account.NewAccountHandler(accountService)
+	accountHandler := account.NewAccountHandler(accountService, store)
 	accountGroup := r.Group("/account")
 	{
 		accountGroup.POST("/register", registerLimiter, accountHandler.CreateAccount)
 		accountGroup.POST("/login", loginLimiter, accountHandler.Login)
 		accountGroup.POST("/findByID", accountHandler.FindByID)
 		accountGroup.POST("/findByUsername", accountHandler.FindByUsername)
-		accountGroup.POST("/refresh", accountHandler.Refresh)
+		accountGroup.POST("/refresh", refreshLimiter, accountHandler.Refresh)
 	}
 	protectedAccountGroup := accountGroup.Group("")
 	protectedAccountGroup.Use(jwt.JWTAuth(accountRepository, cache))
@@ -63,14 +67,24 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 	// video
 	videoRepository := video.NewVideoRepository(db)
 	outboxRepository := video.NewOutboxRepository(db)
+	// Outbox 运维入口：failed 是终态，必须能查、能重放；否则「失败」等于静默丢弃。
+	// 只有配置了 ADMIN_TOKEN 才注册，默认不暴露。
+	if adminToken != "" {
+		outboxAdmin := newOutboxAdminHandler(outboxRepository)
+		adminGroup := r.Group("/admin/outbox", adminTokenAuth(adminToken))
+		adminGroup.GET("/stats", outboxAdmin.Stats)
+		adminGroup.GET("/failed", outboxAdmin.ListFailed)
+		adminGroup.POST("/replay", outboxAdmin.Replay)
+		log.Printf("Outbox admin API enabled: /admin/outbox/* (requires X-Admin-Token)")
+	}
 	popularityMQ, err := rabbitmq.NewPopularityMQ(rmq)
 	if err != nil {
 		log.Printf("PopularityMQ init failed (mq disabled): %v", err)
 		popularityMQ = nil
 	}
 	videoService := video.NewVideoService(videoRepository, cache, popularityMQ)
-	videoHandler := video.NewVideoHandler(videoService, accountService)
-	chunkHandler := video.NewChunkUploadHandler(cache)
+	videoHandler := video.NewVideoHandler(videoService, accountService, store)
+	chunkHandler := video.NewChunkUploadHandler(cache, store)
 	videoGroup := r.Group("/video")
 	{
 		videoGroup.POST("/listByAuthorID", videoHandler.ListByAuthorID)
@@ -164,24 +178,32 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 		followerCount, _ := socialRepository.CountFollowers(c.Request.Context(), req.AccountID)
 		vloggerCount, _ := socialRepository.CountVloggers(c.Request.Context(), req.AccountID)
 
+		// 账号头像在库里是 object key，响应时解析成可访问 URL（预签名 / 本地静态路径）。
+		avatarURL := acc.AvatarURL
+		if u, rErr := store.Resolve(c.Request.Context(), acc.AvatarURL); rErr == nil {
+			avatarURL = u
+		}
+
 		c.JSON(200, account.GetProfileResponse{
-			Account:    account.FindByIDResponse{ID: acc.ID, Username: acc.Username, AvatarURL: acc.AvatarURL, Bio: acc.Bio},
+			Account:    account.FindByIDResponse{ID: acc.ID, Username: acc.Username, AvatarURL: avatarURL, Bio: acc.Bio},
 			VideoCount: videoCount, TotalLikes: totalLikes,
 			FollowerCount: followerCount, VloggerCount: vloggerCount,
 		})
 	})
 	// feed
 	feedRepository := feed.NewFeedRepository(db)
-	feedService := feed.NewFeedService(feedRepository, likeRepository, cache)
+	feedService := feed.NewFeedService(feedRepository, likeRepository, cache, store)
 	feedHandler := feed.NewFeedHandler(feedService)
 	// 热榜快照后台预生成：把「合并 60 个分钟桶」这个 O(N) 阻塞命令从读请求路径上挪走。
 	feed.StartHotSnapshotBuilder(context.Background(), feedService, time.Minute)
+	// 部分丢失自愈：只判断 ZSET 是否为空的旧逻辑发现不了「少了几条」
+	feed.StartTimelineReconciler(context.Background(), feedService, feed.TimelineReconcileInterval)
 	feedGroup := r.Group("/feed")
 	feedGroup.Use(jwt.SoftJWTAuth(accountRepository, cache))
 	{
 		feedGroup.POST("/listLatest", feedHandler.ListLatest)
-		feedGroup.POST("/listLikesCount", feedHandler.ListLikesCount)
 		feedGroup.POST("/listByPopularity", feedHandler.ListByPopularity)
+		feedGroup.POST("/listTags", feedHandler.ListTags)
 		feedGroup.POST("/listByTag", feedHandler.ListByTag)
 	}
 	protectedFeedGroup := feedGroup.Group("")
@@ -228,12 +250,25 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 
 	// 死信队列也要有人消费，否则它只是把失败消息挪了个地方、仍然没人知道。
 	// 这几个队列的消费者都在 API 进程内，所以它们的死信消费者也在这里启动。
-	startDLQConsumers(workerCtx, rmq, []string{
+	startDLQConsumers(workerCtx, db, rmq, []string{
 		rabbitmq.TimelineTopic.Queue,
 		"notification.like",
 		"notification.comment",
 		"notification.social",
 	})
+
+	// 这四类队列的消费者都在 API 进程内，积压指标也在这里采样。
+	if rmq != nil {
+		queues := []string{
+			rabbitmq.TimelineTopic.Queue,
+			rabbitmq.RetryQueueName(rabbitmq.TimelineTopic.Queue),
+			"notification.like", "notification.comment", "notification.social",
+			rabbitmq.RetryQueueName("notification.like"),
+			rabbitmq.RetryQueueName("notification.comment"),
+			rabbitmq.RetryQueueName("notification.social"),
+		}
+		go observability.SampleQueueDepth(workerCtx, rmq.Conn, queues, 15*time.Second)
+	}
 
 	// SSE notification
 	// 通知队列与业务队列绑定在**同一个交换机**上：一次事件、多份消费（落库一份、通知一份）。
@@ -311,10 +346,10 @@ func SetRouter(db *gorm.DB, cache *rediscache.Client, rmq *rabbitmq.RabbitMQ) *g
 
 // startDLQConsumers 为「在 API 进程内消费」的队列启动死信消费者。
 //
-// 死信队列只做「记录 + 告警」，不重新投递：能走到这里的消息已经经历了进程内退避重试
-// 和多轮 TTL 延迟重投，继续 requeue 只会让一条注定失败的消息反复冲击数据库。
-// 不启动它的话，死信队列只是把失败消息挪了个地方，仍然没有任何人知道。
-func startDLQConsumers(ctx context.Context, rmq *rabbitmq.RabbitMQ, mainQueues []string) {
+// 死信队列只做「记录 + 告警」：消息落进 dead_letters 表并计数，不重新投递。
+// 能走到这里的消息已经经历了进程内退避重试和多轮 TTL 延迟重投，继续 requeue
+// 只会让一条注定失败的消息反复冲击数据库。
+func startDLQConsumers(ctx context.Context, db *gorm.DB, rmq *rabbitmq.RabbitMQ, mainQueues []string) {
 	if rmq == nil {
 		return
 	}
@@ -332,7 +367,7 @@ func startDLQConsumers(ctx context.Context, rmq *rabbitmq.RabbitMQ, mainQueues [
 					time.Sleep(5 * time.Second)
 					continue
 				}
-				if err := worker.NewDLQWorker(mainQueue).Run(ctx, ch); err != nil {
+				if err := worker.NewDLQWorker(db, mainQueue).Run(ctx, ch); err != nil {
 					if ctx.Err() != nil {
 						ch.Close()
 						return

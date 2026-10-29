@@ -44,56 +44,7 @@ func (f *FeedHandler) ListLatest(c *gin.Context) {
 	}
 	feedItems, err := f.service.ListLatest(c.Request.Context(), req.Limit, cursor, viewerAccountID)
 	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	feedItems.VideoList = nonNilFeedVideoItems(feedItems.VideoList)
-	c.JSON(200, feedItems)
-}
-
-func (f *FeedHandler) ListLikesCount(c *gin.Context) {
-	var req ListLikesCountRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
-		return
-	}
-	if req.Limit <= 0 || req.Limit > 50 {
-		req.Limit = 10
-	}
-
-	var cursor *LikesCountCursor
-	if req.LikesCountBefore != nil || req.IDBefore != nil {
-		if req.LikesCountBefore == nil || req.IDBefore == nil {
-			c.JSON(400, gin.H{"error": "likes_count_before and id_before must be provided together"})
-			return
-		}
-
-		likesCountBefore := *req.LikesCountBefore
-		idBefore := *req.IDBefore
-
-		if likesCountBefore < 0 {
-			c.JSON(400, gin.H{"error": "invalid cursor: likes_count_before must be >= 0"})
-			return
-		}
-		if idBefore == 0 {
-			if likesCountBefore != 0 {
-				c.JSON(400, gin.H{"error": "invalid cursor: id_before must be > 0"})
-				return
-			}
-		} else {
-			cursor = &LikesCountCursor{
-				LikesCount: likesCountBefore,
-				ID:         idBefore,
-			}
-		}
-	}
-	viewerAccountID, err := jwt.GetAccountID(c)
-	if err != nil {
-		viewerAccountID = 0
-	}
-	feedItems, err := f.service.ListLikesCount(c.Request.Context(), req.Limit, cursor, viewerAccountID)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	feedItems.VideoList = nonNilFeedVideoItems(feedItems.VideoList)
@@ -145,6 +96,14 @@ func (f *FeedHandler) ListByPopularity(c *gin.Context) {
 	if req.Limit <= 0 || req.Limit > 50 {
 		req.Limit = 10
 	}
+	if req.Offset < 0 {
+		c.JSON(400, gin.H{"error": "offset must be >= 0"})
+		return
+	}
+	if req.AsOf < 0 {
+		c.JSON(400, gin.H{"error": "as_of must be >= 0"})
+		return
+	}
 	viewerAccountID, err := jwt.GetAccountID(c)
 	if err != nil {
 		viewerAccountID = 0
@@ -178,9 +137,10 @@ func (f *FeedHandler) ListByPopularity(c *gin.Context) {
 		latestPopularity,
 		latestBefore,
 		latestIDBefore,
+		req.ForceDB,
 	)
 	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 	resp.VideoList = nonNilFeedVideoItems(resp.VideoList)
@@ -194,13 +154,30 @@ func nonNilFeedVideoItems(items []FeedVideoItem) []FeedVideoItem {
 	return items
 }
 
-func (h *FeedHandler) ListByTag(c *gin.Context) {
-	var req struct {
-		TagName string `json:"tag_name"`
-		Limit   int    `json:"limit"`
-	}
+func (h *FeedHandler) ListTags(c *gin.Context) {
+	var req ListTagsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
+		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
+		return
+	}
+	if req.Limit <= 0 || req.Limit > 100 {
+		req.Limit = 20
+	}
+	tags, err := h.service.ListTags(c.Request.Context(), req.Limit)
+	if err != nil {
+		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
+		return
+	}
+	if tags == nil {
+		tags = []TagSummary{}
+	}
+	c.JSON(200, ListTagsResponse{Tags: tags})
+}
+
+func (h *FeedHandler) ListByTag(c *gin.Context) {
+	var req ListByTagRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 	if req.TagName == "" {
@@ -210,11 +187,24 @@ func (h *FeedHandler) ListByTag(c *gin.Context) {
 	if req.Limit <= 0 || req.Limit > 50 {
 		req.Limit = 10
 	}
+	// 与 listLatest 相同的复合游标契约：时间与 id 必须成对出现。
+	var cursor *TimelineCursor
+	if req.LatestTime > 0 || req.LatestIDBefore != nil {
+		if req.LatestTime <= 0 || req.LatestIDBefore == nil || *req.LatestIDBefore == 0 {
+			c.JSON(400, gin.H{"error": "latest_time and latest_id_before must be provided together"})
+			return
+		}
+		cursor = &TimelineCursor{
+			CreateTime: time.UnixMilli(req.LatestTime),
+			ID:         *req.LatestIDBefore,
+		}
+	}
 	viewerAccountID, _ := jwt.GetAccountID(c)
-	items, err := h.service.ListByTag(c.Request.Context(), req.TagName, req.Limit, viewerAccountID)
+	resp, err := h.service.ListByTag(c.Request.Context(), req.TagName, req.Limit, cursor, viewerAccountID)
 	if err != nil {
 		c.JSON(apierror.ClassifyHTTPStatus(err), gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"video_list": nonNilFeedVideoItems(items)})
+	resp.VideoList = nonNilFeedVideoItems(resp.VideoList)
+	c.JSON(200, resp)
 }

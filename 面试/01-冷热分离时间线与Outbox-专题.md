@@ -1,8 +1,14 @@
-# 冷热分离时间线 + Outbox 模块学习文档
+# 01 · 冷热分离时间线 + Outbox（专题）
+
+> 配套 Q&A：`11-冷热分离时间线-面试QA.md`
+> 全局索引与代码锚点总表：`00-索引-面试文档地图.md`
+> **行号基准：2026-10-27**
 
 > 覆盖链路：`发布视频` → `Outbox 本地消息表` → `RabbitMQ` → `Redis ZSET 热时间线` → `Feed 冷热分离查询`
 >
-> 本文配合代码阅读，文中所有「改前 / 改后」指的是本次对 4 个可靠性缺陷的修复。
+> 本文配合代码阅读。文中「改前 / 改后」指两轮可靠性修复：第一轮是 confirm、状态机、poller 自愈、消费端有限重试；第二轮是稳定 `event_id`、fencing token、崩溃接管、三级容错。
+>
+> **第三轮同步（当前实现）**：发布端退避加 ±30% 抖动、broker/连接级故障与消息级失败分流（`MarkDeferred`）、`PublishWithDeferredConfirm` 按 `DeliveryTag` 精确等待、`last_error` 落库、`PurgeSent` 分批删除、周期 `Stats` + `[ALERT]` + `/metrics` gauge、`/admin/outbox/*` 查询与重放接口。文末「还没做的」已按现状重写。
 
 ---
 
@@ -35,15 +41,21 @@ COMMIT;
 
 代码位置：
 
-```47:75:backend/internal/video/video_service.go
+```50:68:backend/internal/video/video_service.go
 	//事务保证视频写入库和消息写入本地消息表的一致性
 	err := vs.repo.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(video).Error; err != nil {
 			return err
 		}
 
+		// 幂等键必须和业务数据同事务落库，重投时才能保持同一个 event_id
+		eventID, err := rabbitmq.NewEventID()
+		if err != nil {
+			return err
+		}
 		msg := OutboxMsg{
 			VideoID:    video.ID,
+			EventID:    &eventID,
 			EventType:  "video_published",
 			Status:     OutboxStatusPending,
 			CreateTime: video.CreateTime,
@@ -66,8 +78,8 @@ COMMIT;
 │  StartOutboxPoller (goroutine, 1s 轮询)                          │
 │        │ ① ListDue   : 取到期消息                                │
 │        │ ② Claim     : CAS 抢占 pending→processing               │
-│        │ ③ PublishVideo : 发 MQ + 等 publisher confirm           │
-│        │ ④ MarkSent / MarkRetry / MarkFailed                     │
+│        │ ③ PublishVideo : 发 MQ + 按 DeliveryTag 等 confirm       │
+│        │ ④ MarkSent / MarkDeferred / MarkRetry / MarkFailed      │
 │        ▼                                                        │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ video.timeline.events (topic)
@@ -81,21 +93,30 @@ COMMIT;
 ┌─────────────────────────▼───────────────────────────────────────┐
 │  StartConsumer (goroutine, 仍在 API 进程)                        │
 │        │ 反序列化 TimelineEvent                                  │
-│        │ ZADD feed:global_timeline  score=create_time(ms)        │
-│        │                            member=video_id              │
-│        │ ZREMRANGEBYRANK 0 -1001   ← 只保留最近 1000 条          │
+│        │ Lua 原子执行：                                          │
+│        │   ZADD feed:global_timeline score=create_time(ms)       │
+│        │                              member=video_id            │
+│        │   ZREMRANGEBYRANK 0 -(capacity+1)  ← 只保留最近 1000 条  │
+│        │   ZCARD                                                  │
 │        ▼                                                        │
 │  Redis ZSET: feed:global_timeline   ← 这就是「热时间线」         │
 └─────────────────────────┬───────────────────────────────────────┘
                           │
 ┌─────────────────────────▼───────────────────────────────────────┐
-│  FeedService.ListLatest(ctx, limit, latestBefore)               │
+│  FeedService.ListLatest(ctx, limit, cursor, viewerAccountID)     │
 │    取 ZSET 最老一条的 score 作为 watermark                       │
-│    reqTime > watermark  → 热区：ZREVRANGEBYSCORE 查 Redis        │
-│    reqTime <= watermark → 冷区：create_time < ? 查 MySQL         │
-│    热区不够 limit 条     → 用最后一条的时间缝合冷区（不回写 ZSET） │
+│    cursor == nil 或 reqTime > watermark → 热区：Redis ZSET       │
+│    reqTime <= watermark → 冷区：MySQL 复合游标                   │
+│    热区不足 want(=limit+1) → 用最后一条 (create_time,id) 缝合    │
+│    has_more = 冷热合并后是否超过 limit 条                          │
 └─────────────────────────────────────────────────────────────────┘
+
+后台任务：
+  每 5 分钟对账 MySQL 最新 1000 条 vs ZSET，只补缺失 member；
+  删除视频时删库 + 失效实体缓存 + ZREM 热时间线。
 ```
+
+**一句话概括**：写入侧用 Lua 保证「加一条 + 裁一条」原子；读取侧用 `(create_time,id)` 复合游标把 Redis 热区和 MySQL 冷区串成一条有序流；`has_more` 靠多取一条独立探测；丢失靠重建 + 对账自愈。
 
 ---
 
@@ -105,31 +126,45 @@ COMMIT;
 |---|---|
 | `backend/internal/video/video_entity.go` | `OutboxMsg` 结构体 + 状态常量 + 退避计算 |
 | `backend/internal/video/outbox_repo.go` | Outbox 表的全部 SQL（查询/抢占/状态流转/回收/清理） |
-| `backend/internal/video/video_service.go` | 发布视频，业务数据与 Outbox 同事务 |
-| `backend/internal/worker/outboxworker.go` | `StartOutboxPoller`（投递）+ `StartConsumer`（写 ZSET） |
-| `backend/internal/middleware/rabbitmq/timelineMQ.go` | 发布端封装，**publisher confirm** 就在这里 |
-| `backend/internal/feed/service.go` | `ListLatest` 冷热分离查询（156-298 行） |
-| `backend/internal/feed/repo.go` | 冷数据游标查询 |
+| `backend/internal/video/timeline.go` | 热时间线 key 与容量常量 `TimelineCapacity = 1000` |
+| `backend/internal/video/video_service.go` | 发布视频（业务数据 + Outbox 同事务）；删除视频时 `ZREM` 热时间线 |
+| `backend/internal/worker/outboxworker.go` | `StartOutboxPoller`（投递 + 周期告警）+ `StartConsumer`（Lua 原子写 ZSET） |
+| `backend/internal/middleware/rabbitmq/timelineMQ.go` | 发布端封装，`PublishWithDeferredConfirm` 精确 confirm 就在这里 |
+| `backend/internal/http/outbox_admin.go` | `/admin/outbox/stats|failed|replay` 运维接口 |
+| `backend/internal/observability/` | `/metrics` 指标（`feedsystem_outbox_*`） |
+| `backend/internal/feed/service.go` | `ListLatest` 冷热分离查询、空 ZSET 重建、5 分钟对账 |
+| `backend/internal/feed/repo.go` | 冷数据复合游标查询 |
+| `backend/internal/middleware/redis/zset.go` | ZSET 封装（`ZRem` 用于删除清理） |
 
 ---
 
 ## 3. Outbox 状态机
 
 ```
-                    ┌──────────────────────────────────────┐
-                    │                                      │
-                    ▼                                      │
-              [ pending ] ──Claim(CAS)──> [ processing ]   │
-                    ▲                          │           │
-                    │                          │           │
-        MarkRetry   │                          ├─ 成功 ─> [ sent ] ──24h──> 删除
-     (retry_count+1,│                          │
-      指数退避)      │                          └─ 重试耗尽 ─> [ failed ]
-                    │                                        (终态, 等人工)
+                    ┌──────────────────────────────────────────────┐
+                    │                                              │
+                    ▼                                              │
+              [ pending ] ──Claim(CAS)──> [ processing ]          │
+                    ▲                          │                  │
+                    │                          │                  │
+                    │ MarkRetry                ├─ 成功 ─> [ sent ] ──24h──> 删除
+                    │ (retry_count+1,          │
+                    │  指数退避+抖动)           └─ 重试耗尽 ─> [ failed ]
+                    │                                              (终态, 等人工)
+                    │ MarkDeferred
+                    │ (broker 级故障, retry_count 不变, 5s 后可见)
                     │
-        ReapStuck:  claimed_at 超时(60s) 未落地 → 回收回 pending
-                （处理进程崩溃的场景）
+              ReapStuck: claimed_at 超时(60s) 未落地 → 回收回 pending
+                       （处理进程崩溃 / 假死；同样消耗一次重试额度）
 ```
+
+三个回退到 `pending` 的入口，语义不同：
+
+| 入口 | 触发 | 是否消耗重试额度 | 下次可见 |
+|---|---|---|---|
+| `MarkRetry` | 消息级投递失败 | 是（+1） | 指数退避 + ±30% 抖动 |
+| `MarkDeferred` | broker/连接级故障（channel 关闭、I/O 失败、confirm 超时） | **否** | 固定 5s |
+| `ReapStuck` | `processing` 超过 60s 未落地 | 是（+1），超限转 `failed` | 立即 |
 
 ### 为什么需要 `processing` 这个中间态？
 
@@ -137,22 +172,39 @@ COMMIT;
 
 ### 为什么用 CAS 而不是 `SELECT ... FOR UPDATE SKIP LOCKED`？
 
-```40:53:backend/internal/video/outbox_repo.go
+```go
 // Claim 抢占一条消息：只有把 status 从 pending 改成 processing 的那个实例拿到发送权。
-// 多实例部署时其余实例会拿到 RowsAffected=0，直接跳过，天然去重。
-func (r *OutboxRepository) Claim(ctx context.Context, id uint, now time.Time) (bool, error) {
+// 返回的 token 是 fencing 令牌，后续 MarkXxx 必须原样带回。
+func (r *OutboxRepository) Claim(ctx context.Context, id uint, now time.Time) (token string, ok bool, err error) {
+	token, err = newClaimToken()
+	if err != nil {
+		return "", false, err
+	}
 	tx := r.db.WithContext(ctx).Model(&OutboxMsg{}).
 		Where("id = ? AND status = ?", id, OutboxStatusPending).
 		Updates(map[string]interface{}{
-			"status":     OutboxStatusProcessing,
-			"claimed_at": now,
+			"status":      OutboxStatusProcessing,
+			"claimed_at":  now,
+			"claim_token": token,
 		})
 	if tx.Error != nil {
-		return false, tx.Error
+		return "", false, tx.Error
 	}
-	return tx.RowsAffected == 1, nil
+	if tx.RowsAffected != 1 {
+		return "", false, nil // 已被其他实例抢走
+	}
+	return token, true, nil
 }
 ```
+
+状态迁移统一走 `updateWithToken`：
+
+```go
+Where("id = ? AND status = ? AND claim_token = ?", id, OutboxStatusProcessing, token).
+	Updates(values)
+```
+
+`RowsAffected=1` 才算生效；旧持有者恢复后拿着过期 token 更新会命中 0 行，只能记日志放弃。
 
 `SKIP LOCKED` 需要把「发消息到 RabbitMQ」这段网络 I/O 包在数据库事务里——事务会长达几十毫秒，锁竞争很痛。CAS 只在**一条 UPDATE** 上加行锁，拿到发送权之后再慢慢发。**安全性等价，性能更好**，这是面试可以说的一个点。
 
@@ -164,9 +216,25 @@ func (r *OutboxRepository) Claim(ctx context.Context, id uint, now time.Time) (b
 
 ```go
 func OutboxBackoff(retryCount int) time.Duration {
-	// 第 n 次重试等待 2s * 2^(n-1)：2s, 4s, 8s, 16s, 32s
+	if retryCount <= 0 {
+		return 0
+	}
+	shift := retryCount - 1
+	if shift > 10 { // 防止移位溢出
+		shift = 10
+	}
+	base := OutboxBaseBackoff * time.Duration(1<<uint(shift)) // 2s, 4s, 8s, 16s, 32s
+	delta := base * 3 / 10                                    // ±30%
+	return base - delta + time.Duration(rand.Int63n(int64(2*delta)))
 }
 ```
+
+名义值仍是 `2s × 2^(n-1)`，实际区间为
+`1.4~2.6 / 2.8~5.2 / 5.6~10.4 / 11.2~20.8 / 22.4~41.6s`。
+
+**为什么要 ±30% 抖动**：多实例部署时，各实例的退避相位会趋同；broker 恢复的瞬间它们会一起重试，形成二次尖峰。±30% 足以打散相位，同时相邻退避区间不重叠，不破坏「次数越多等越久」的指数性质。
+
+> broker/连接级故障不走这条路径，而是 `MarkDeferred`（5s 后可见、`retry_count` 不变），详见 §5。
 
 失败的消息不是「下一轮立刻再试」，而是写入 `next_retry_at`，**到点才可见**：
 
@@ -197,20 +265,43 @@ if err == nil {
 ### 改后
 
 ```go
-// 通道开启 confirm 模式
+// 通道开启 confirm 模式（Confirm(false) = 非阻塞，Confirm 调用本身不等 broker）
 if err := ch.Confirm(false); err != nil { ... }
-confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
 
-// 发布后必须等到 broker 的 ACK 才算成功
-if err := PublishJSON(ctx, t.ch, ...); err != nil {
-	return err
+// 每条消息拿到自己的 DeferredConfirmation，按 DeliveryTag 精确等待
+dc, err := ch.PublishWithDeferredConfirm(exchange, rk, false, false, amqp.Publishing{
+	ContentType:  "application/json",
+	DeliveryMode: amqp.Persistent,
+	Body:         body,
+})
+if err != nil {
+	return fmt.Errorf("%w: publish: %v", ErrBrokerUnavailable, err)
 }
-return t.waitConfirm(ctx)
+
+waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+defer cancel()
+acked, err := dc.WaitContext(waitCtx)
+if err != nil {
+	return fmt.Errorf("%w: confirm timeout: %v", ErrBrokerUnavailable, err)
+}
+if !acked {
+	if ch.IsClosed() { // channel 关闭时库会把所有未决确认置为 NACK
+		return fmt.Errorf("%w: channel closed before confirm", ErrBrokerUnavailable)
+	}
+	return fmt.Errorf("%w: delivery tag %d", ErrPublishRejected, dc.DeliveryTag)
+}
+return nil
 ```
 
-`waitConfirm` 有三种失败：NACK（broker 拒绝）、超时（5s）、通知通道关闭。任一失败都按「投递失败」处理，交给 Outbox 退避重试。
+失败分三类：
 
-> ⚠️ 实现细节：这里「取下一条确认」而不是精确匹配 `DeliveryTag`，前提是 `PublishVideo` **串行调用**（poller 是单 goroutine 循环）。一旦超时，调用方会重建 channel，避免迟到的确认被下一条消息误当成自己的 ACK。这是刻意的简化，面试被问到要能讲出来。
+| 失败 | 分类 | Outbox 的处理 |
+|---|---|---|
+| channel 关闭、publish I/O 失败、confirm 5s 超时 | `ErrBrokerUnavailable`（基础设施故障） | `MarkDeferred`：5s 后重试，**不消耗重试额度**；重建 channel |
+| channel 仍存活时 broker 明确 NACK | `ErrPublishRejected`（消息级失败） | `MarkRetry`：指数退避 + 抖动，5 次后转 `failed` |
+| 消息构造失败（videoID 为空、JSON 序列化失败） | 普通 error | 按消息级失败处理 |
+
+> 早期实现用 `NotifyPublish` + 「取下一条确认」，靠 `PublishVideo` 串行调用来保证不错位。现在已改成 `DeferredConfirmation` 按 `DeliveryTag` 精确匹配：迟到的 ACK 只会落在自己那条消息上，即使将来改成并发发布也不会串。
 
 ---
 
@@ -219,24 +310,38 @@ return t.waitConfirm(ctx)
 改前是 `Delete(&msg)`，没有任何重试语义；改后是一条完整的流水线：
 
 ```go
-claimed, err := repo.Claim(ctx, msg.ID, now)   // 抢占
-if !claimed { continue }                       // 被别人抢走，跳过
+token, claimed, err := repo.Claim(ctx, msg.ID, now) // 抢占，返回 fencing token
+if !claimed { continue }                             // 被别人抢走，跳过
 
-err = tmq.PublishVideo(pubCtx, msg.VideoID, msg.CreateTime)  // 含 confirm
+eventID := ""
+if msg.EventID != nil { eventID = *msg.EventID }
+pubErr := tmq.PublishVideo(pubCtx, msg.VideoID, msg.CreateTime, eventID) // 含 confirm
 
-switch {
-case err == nil:
-	repo.MarkSent(ctx, msg.ID, time.Now())
-case msg.RetryCount+1 > video.OutboxMaxRetries:
-	repo.MarkFailed(ctx, msg.ID)              // 转终态，不再无限重试
-default:
-	repo.MarkRetry(ctx, msg.ID, msg.RetryCount+1, time.Now())
-	_ = tmq.Close(); tmq = nil                 // 大概率是 channel 坏了，重建
-	break                                       // 跳出本批，别撞同一条坏连接
+if pubErr == nil {
+	repo.MarkSent(ctx, msg.ID, token, time.Now())   // 失败/令牌失效只记日志
+	continue
 }
+
+// 基础设施故障：消息本身没问题，不烧重试额度
+if errors.Is(pubErr, rabbitmq.ErrBrokerUnavailable) {
+	repo.MarkDeferred(ctx, msg.ID, token, time.Now(), video.OutboxBrokerRetryDelay, errText(pubErr))
+	_ = tmq.Close(); tmq = nil                       // 大概率整条 channel 坏了，重建
+	break                                            // 跳出本批，别撞同一条坏连接
+}
+
+// 消息级失败：消耗重试额度，耗尽后转 failed
+if msg.RetryCount+1 > video.OutboxMaxRetries {
+	repo.MarkFailed(ctx, msg.ID, token, errText(pubErr))
+	continue
+}
+repo.MarkRetry(ctx, msg.ID, token, msg.RetryCount+1, time.Now(), errText(pubErr))
+// 不重建 channel：NACK 是这条消息的问题，不代表连接坏了
 ```
 
-注意最后两行：**投递失败后立刻重建 channel**。因为「一条失败」往往意味着整条连接都有问题，继续用同一条 channel 发下面 99 条只会全部失败。
+两个关键点：
+
+1. **只有 broker/连接级故障才重建 channel 并跳出本批**。旧实现「任何失败都 Close + break」会把一条坏消息升级成整批延迟；
+2. **`MarkDeferred` 不增加 `retry_count`**。否则「MQ 停机 2 分钟」就足以把积压消息全部烧成 `failed`——基础设施故障被误判成消息问题。
 
 ---
 
@@ -272,6 +377,10 @@ if tmq == nil {
 
 **语义变化**：MQ 不可用期间，消息在 `outbox_msgs` 里安全积压；MQ 恢复后 poller 自动补发，Feed 最终补齐。这才是「降级不丢数据」。
 
+运行中 channel 失效走另一条路：`PublishVideo` 返回 `ErrBrokerUnavailable` → `MarkDeferred`（5s 后可见、不烧额度）→ 关闭并重建 channel。因此「MQ 半死不活」也不再会把消息烧成 `failed`。
+
+> 永久性拓扑损坏（例如交换机被误删，broker 关闭 channel）会表现为持续的 `ErrBrokerUnavailable`，消息一直留在 `pending`。这是刻意取舍：宁可让消息等着，也不把可能正确的消息判死；由「最老 pending > 5min」的 `[ALERT]` 兜底。
+
 ---
 
 ## 7. 修复 ④：消费端不再无限 requeue
@@ -298,6 +407,8 @@ c := &Consumer{
 	Name:  "TimelineConsumer",
 	Queue: queueName,
 	Retry: retry,                       // rabbitmq.RetryRouter
+	// 时间线跑在 QoS=10 的单条流上，进程内 sleep 重试会阻塞整条流
+	MaxLocalRetries: 1,
 	Process: func(ctx context.Context, d amqp.Delivery) error {
 		return processTimeline(ctx, redisClient, d)
 	},
@@ -306,10 +417,13 @@ c := &Consumer{
 
 ```
 写 ZSET 失败
-  → 进程内指数退避 3 次（1s/2s/4s + jitter）
+  → 进程内 1 次退避重试（默认骨架是 1+3 次；时间线用 MaxLocalRetries=1）
   → 仍失败：投到 video.timeline.update.queue.retry，TTL 30s 后自动重投（最多 3 轮）
-  → 仍失败：Nack(requeue=false) → video.timeline.update.queue.dlx 死信队列告警
+  → 仍失败：Nack(requeue=false) → video.timeline.update.queue.dlx 死信队列
+       → DLQWorker 落 dead_letters 表（(queue,event_id) 唯一 + INSERT IGNORE）+ 指标 + 日志
 ```
+
+**为什么时间线只留 1 次本地重试**：进程内 `sleep` 是串行阻塞的，QoS=10 的流会被一条失败消息拖住。把重试尽快交给 TTL 重试队列，既释放消费者，又保留 at-least-once 语义。
 
 **为什么改掉了「3 次后 Ack 丢弃」**：那是把 Outbox 辛辛苦苦保证的 at-least-once
 在最后一环丢掉了，而且时间线少一条**没有任何报错**，是最难排查的一类故障。
@@ -324,20 +438,24 @@ c := &Consumer{
 
 因为 ZSET 的 member 是 `video_id`，重复 `ZADD` 同一个 member 只是**覆盖 score**，不会重复出现：
 
-```251:262:backend/internal/worker/outboxworker.go
+```go
 // zaddTimeline 单次写入。ZSET 的 member 是 video_id，重复写入是幂等覆盖，
 // 所以"至少一次投递"不会造成脏数据——这正是 Outbox 可以放心重试的前提。
 func zaddTimeline(ctx context.Context, redisClient *rediscache.Client, event *rabbitmq.TimelineEvent) error {
 	opCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 
-	timelineKey := redisClient.Key("feed:global_timeline")
-	if err := redisClient.ZAdd(opCtx, timelineKey, oredis.Z{
-		Score:  float64(event.CreateTime),
-		Member: fmt.Sprintf("%d", event.VideoID),
-	}); err != nil {
-		return err
-	}
+	// 写入与裁剪必须原子：分两条命令时中间会露出 1001 条的窗口
+	_, err := redisClient.Eval(opCtx, timelineZAddAndTrim, []string{video.TimelineZSetKey(redisClient)},
+		float64(event.CreateTime), fmt.Sprintf("%d", event.VideoID), video.TimelineCapacity)
+	return err
+}
+
+const timelineZAddAndTrim = `
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -(tonumber(ARGV[3]) + 1))
+return redis.call('ZCARD', KEYS[1])
+`
 ```
 
 **这是整个设计的基石**：幂等性把「不重复投递」这个很难保证的性质，降级成了「重复了也无所谓」。所以我们可以放心地用 at-least-once + 重试，而不必追求 exactly-once。
@@ -407,7 +525,7 @@ pubErr := tmq.PublishVideo(pubCtx, msg.VideoID, msg.CreateTime, eventID)
 
 | # | 缺陷 | 后果 | 修复 |
 |---|---|---|---|
-| 1 | `MarkSent/MarkRetry/MarkFailed` 只校验 `status='processing'`，**不校验归属** | Worker A 卡住 61s 被回收 → B 抢占 → A 恢复后调 `MarkSent` **把 B 还没发成功的消息标成 sent** → 消息永久丢失 | **fencing token**：`Claim` 生成随机令牌写进 `claim_token`，所有状态迁移都带 `WHERE claim_token = ?`；旧持有者拿到 `ok=false` 时只记日志、不动状态 |
+| 1 | `MarkSent/MarkDeferred/MarkRetry/MarkFailed` 只校验 `status='processing'`，**不校验归属** | Worker A 卡住 61s 被回收 → B 抢占 → A 恢复后调 `MarkSent` **把 B 还没发成功的消息标成 sent** → 消息永久丢失 | **fencing token**：`Claim` 生成随机令牌写进 `claim_token`，所有状态迁移（含 `MarkDeferred`）都带 `WHERE claim_token = ?`；旧持有者拿到 `ok=false` 时只记日志、不动状态 |
 | 2 | `lastReap := time.Now()`，启动后要等 30s 才第一次回收 | 进程崩溃重启后，残留消息**白等 30 秒**才被接管 | 改成 `var lastReap time.Time`（零值），启动第一轮**立刻**回收 |
 | 3 | `ReapStuck` 只改状态，不增加 `retry_count` | 「抢占→崩溃→回收→抢占」可**无限循环**，永远不进 `failed`、没有告警出口 | 回收**同样消耗一次重试额度**，超限转 `failed`；同时清 `claim_token`、把 `next_retry_at` 置空让它立即可见 |
 
@@ -441,84 +559,118 @@ T61  B: 投递成功，MarkSent(id=7, tok2) → ok=true → sent
 
 ## 9. 冷热分离查询
 
-```156:167:backend/internal/feed/service.go
-// 查询最新视频 (冷热分离 + 游标分页)
-func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore time.Time, viewerAccountID uint) (ListLatestResponse, error) {
-	if f.rediscache == nil {
-		return f.listLatestFromDB(ctx, limit, latestBefore, viewerAccountID)
-	}
+> 本节已按 2026-10-27 的实现重写。旧版本里的 `latestBefore time.Time`、`maxScore = reqTime-1`、只缝合 `CreateTime` 都已过时。
 
-	// 获取 ZSET 中最老的一条数据
-	zsetTail, err := f.rediscache.ZRangeWithScores(ctx, f.rediscache.Key("feed:global_timeline"), 0, 0)
+### 9.1 写入：Lua 原子写入 + 裁剪
+
+消费端不再分两条命令执行 `ZADD` 和 `ZREMRANGEBYRANK`，而是一次 `EVAL`：
+
+```go
+// worker/outboxworker.go
+_, err := redisClient.Eval(opCtx, timelineZAddAndTrim,
+    []string{video.TimelineZSetKey(redisClient)},
+    float64(event.CreateTime),                  // score = create_time(ms)
+    strconv.FormatUint(event.VideoID, 10),      // member = video_id
+    video.TimelineCapacity,                     // 1000
+)
 ```
 
-### 三步判断
-
-**第一步：取水位线。** `ZRANGE key 0 0 WITHSCORES` 拿到 ZSET 里**最老**那条（因为 ZSET 按 score 升序，index 0 是最小的），它的 score 就是 `watermark`——热区的时间下界。
-
-**第二步：比游标。**
-
-```218:239:backend/internal/feed/service.go
-	if reqTime <= watermark {
-		//冷数据降级查库
-		...
-	} else {
-		// 热数据直接查redis
-		maxScore := "+inf"
-		if !latestBefore.IsZero() {
-			maxScore = fmt.Sprintf("%d", reqTime-1) // 防重复
-		}
-		videoIDsStr, err := f.rediscache.ZRevRangeByScore(ctx, ..., maxScore, "-inf", 0, int64(limit))
+```lua
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -(tonumber(ARGV[3]) + 1))
+return redis.call('ZCARD', KEYS[1])
 ```
 
-- 请求游标比水位线新 → 还在热区 → 查 Redis，一条 SQL 都不用
-- 请求游标比水位线老 → 已经翻出热区 → 查 MySQL
+三个要点：
 
-`reqTime-1` 是**严格小于**，保证翻页不会重复拿到上页最后一条。
+1. **原子性**：脚本执行期间 Redis 不会插入其他命令，不存在「刚加完还没裁」的 1001 条窗口；
+2. **容量只有一处定义**：`video.TimelineCapacity = 1000`，写入裁剪、空 ZSET 重建、后台对账共用，避免「重建完立刻被裁」；
+3. **不是事务回滚**：Lua 保证不被穿插，但运行时错误不会撤销已执行的 `ZADD`。正常路径的命令类型固定，不会触发；真出错时靠 5 分钟对账把基数裁回上限。
 
-**第三步：缝合。** 热区凑不满 `limit` 条（刚好跨过冷热边界）时，用热区最后一条的 `CreateTime` 当冷游标，从 MySQL 补齐剩余：
+### 9.2 水位线与分支
 
-```259:277:backend/internal/feed/service.go
-		// 刚好击穿了冷热边界
-		if len(baseVideos) < limit {
-			remainLimit := limit - len(baseVideos) // 计算还差几个
-			var coldCursor time.Time
-			if len(baseVideos) > 0 {
-				coldCursor = baseVideos[len(baseVideos)-1].CreateTime
-			} else {
-				coldCursor = latestBefore
-			}
-			...
-			if err == nil {
-				coldVideos := v.([]*video.Video)
-				baseVideos = append(baseVideos, coldVideos...)
-			}
+**第一步：取水位线。** `ZRANGE key 0 0 WITHSCORES` 拿到 ZSET 里**最老**那条（ZSET 按 score 升序，index 0 最小），它的 score 就是 `watermark`。
+
+**第二步：比游标。** 游标是 `TimelineCursor{CreateTime, ID}`，不是单个时间：
+
+```
+cursor == nil                 → 首页，必在热区
+reqTime > watermark           → 热区：ZREVRANGEBYSCORE
+reqTime <= watermark          → 冷区：MySQL 整页
 ```
 
-**关键取舍**：补齐的冷数据**不回写 ZSET**（第 230 行注释），否则用户随便翻几页就能把历史数据灌进只保留 1000 条的热池，把真正的新视频挤出去——这就是「冷数据污染热点池」。
+为什么 `==` 必须走冷区：`ZREMRANGEBYRANK` 按**排名**裁剪，可能在最小 score 的分组内部切断，热区最老那一毫秒的记录不完整。游标一旦严格大于 watermark，该分数组必然完整（反证：若有成员被裁，它的 score 只会 ≤ watermark）。
 
-### 游标分页 vs OFFSET
+### 9.3 热区取数：上界含游标 + 应用层重排
 
-```20:31:backend/internal/feed/repo.go
-func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBefore time.Time) ([]*video.Video, error) {
-	var videos []*video.Video
-	query := repo.db.WithContext(ctx).Model(&video.Video{}).
-		Order("create_time DESC")
-	if !latestBefore.IsZero() {
-		query = query.Where("create_time < ?", latestBefore)
-	}
-	if err := query.Limit(limit).Find(&videos).Error; err != nil {
-		return nil, err
-	}
-	return videos, nil
+旧实现用 `maxScore = reqTime - 1`，会把游标所在毫秒的其余视频整体排除——这是漏项的根因。现在的做法：
+
+```
+maxScore = reqTime（含）
+count    = want + ZCOUNT(key, reqTime, reqTime)   ← 补上同毫秒兄弟，避免占满名额
+ZREVRANGEBYSCORE key maxScore -inf LIMIT 0 count
+→ 丢弃 score == reqTime && id >= cursor.ID
+→ 按 (score DESC, id DESC) 重排
+→ 截断到 want
+```
+
+**为什么必须应用层重排**：同一 score 下 Redis 按 member 的**字典序**排，`"10" < "9"`，和数值 id 顺序不一致；MySQL 侧是 `ORDER BY id DESC`，两边必须对齐。
+
+**为什么取 `want = limit+1`**：多出的一条不返回给客户端，只用来判断 `has_more`。
+
+### 9.4 缝合与 `has_more`
+
+热区不足 `want` 条（跨过冷热边界，或热区里有视频被删除过滤）时，用**最后一条实际装配成功的视频**的复合游标去 MySQL 补：
+
+```go
+want := limit + 1
+
+if len(baseVideos) < want {
+    remainLimit := want - len(baseVideos)
+    var coldCursor *TimelineCursor
+    if len(baseVideos) > 0 {
+        last := baseVideos[len(baseVideos)-1]
+        coldCursor = &TimelineCursor{CreateTime: last.CreateTime, ID: last.ID}
+    } else {
+        coldCursor = cursor   // 热区为空时回退到入参游标，避免 nil
+    }
+    // 冷区查询失败直接返回错误，不能悄悄返回短页
+}
+
+hasMore := len(baseVideos) > limit
+if hasMore {
+    baseVideos = baseVideos[:limit]
 }
 ```
 
-- `OFFSET 100000` 要扫过前 10 万行再丢弃，越翻越慢；
-- `WHERE create_time < ?` 走 `idx_videos_create_time` 索引，直接定位，**第 1 页和第 1000 页代价一样**；
-- 且期间有新视频插入时，`OFFSET` 会导致「上页末尾重复出现 / 某些条目漏掉」，游标不会。
+两个容易答错的点：
 
-单靠 `create_time` 在同一毫秒多条时会不稳定，工业做法是 `(create_time, id)` 复合游标——热榜那边就是这么做的（`ListByPopularity` 用 `latestPopularity + latestIDBefore`）。时间线这里没做，属于已知简化。
+1. **补一次就够**：冷区直接返回 MySQL 行，没有后置过滤（删除的视频在库里已不存在），所以「冷区返回条数 < `remainLimit`」只可能是真的到底了，不需要循环回源；
+2. **`has_more` 与「页满没满」解耦**：服务端实际查了 `limit+1` 条，只是丢掉多的一条。即使热段被删除过滤掉几条，也会用冷段按缺口补；补不到才是真的到底。
+
+**关键取舍**：补齐的冷数据**不回写 ZSET**。否则用户随便翻几页就能把历史数据灌进只保留 1000 条的热池，把真正的新视频挤出去——这就是「冷数据污染热点池」。
+
+### 9.5 删除与自愈
+
+- **删除视频**：删库 + 失效实体缓存 + 按 `video_id` `ZREM` 热时间线（100ms 预算，失败只记日志）。删不掉的残留靠 `GetVideoByIDs` 装配时过滤。
+- **Redis 整体不可用**：`rediscache == nil` 或 `ZRANGE` 报错，直接走 `listLatestFromDB`。
+- **ZSET 为空**：singleflight 全局收敛，从 MySQL 拉最新 1000 条重建；DB 也为空时返回 `EMPTY_DB` 哨兵防递归。
+- **ZSET 非空但少了几条**：5 分钟对账任务比较 MySQL 最新 1000 条与 ZSET member，**只补缺失、不做差集删除**（对账期间新发布的视频可能不在 MySQL 快照里，删「多余」会误伤）；补完统一按 `TimelineCapacity` 裁剪一次，维持上限。
+
+### 9.6 游标分页 vs OFFSET
+
+```sql
+SELECT * FROM videos
+WHERE (create_time < ?) OR (create_time = ? AND id < ?)
+ORDER BY create_time DESC, id DESC
+LIMIT ?;
+```
+
+- `OFFSET 100000` 要扫过前 10 万行再丢弃，越翻越慢；
+- 复合游标直接 seek 到索引位置，**第 1 页和第 1000 页代价一样**；
+- 期间有新视频插入时，`OFFSET` 会导致「上页末尾重复 / 某些条目漏掉」，游标不会；
+- `idx_videos_create_time (create_time DESC)` 的叶子节点自带主键，逻辑上等价 `(create_time, id)`；但 `OR` 条件是否真的走单段 range，必须用 `EXPLAIN` 验证，不能靠推断。
+- 单用 `create_time` 在同毫秒多条时不稳定，所以时间线现在和热榜一样使用 `(时间, id)` 复合游标（`TimelineCursor`）。
 
 ---
 
@@ -526,15 +678,18 @@ func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBef
 
 | 场景 | 行为 | 结果 |
 |---|---|---|
-| 发布成功，MQ 恰好抖动 | confirm 超时/NACK → MarkRetry → 2s 后再试 | ✅ 最终投递成功 |
+| 发布时 MQ 抖动导致 confirm 超时 / channel 关闭 | `ErrBrokerUnavailable` → `MarkDeferred`（5s 后重试、不烧额度）→ 重建 channel | ✅ 最终投递成功 |
+| broker 明确 NACK 这条消息 | `ErrPublishRejected` → `MarkRetry`（指数退避 + 抖动），5 次后转 `failed` | ✅ 消息级失败才会终态化 |
 | RabbitMQ 整机宕机 5 分钟 | poller 每 5s 重建 TimelineMQ 失败，消息在表里积压；恢复后自动补发 | ✅ 不丢，延迟投递 |
 | 进程在 `processing` 阶段崩溃 | 60s 后 `ReapStuck` 回收回 `pending`；进程重启后第一轮**立刻**回收 | ✅ 不丢 |
 | 崩溃实例恢复后想改状态 | fencing token 校验失败（`claim_token` 已被刷新），只记日志 | ✅ 不会误标别人正在处理的消息 |
 | 两个 API 实例同时轮询 | `Claim` 的 CAS 只有一个拿到 `RowsAffected=1` | ✅ 不重复投递 |
 | 同一消息被重复投递两次 | ZSET member = video_id，覆盖写 | ✅ 幂等，无脏数据 |
 | confirm 丢失但消息其实已落盘 | 按失败处理 → MarkRetry → 重投 | ✅ 消费端幂等，重复无害 |
-| Redis 宕机期间消费消息 | 退避 3 次 → 重试队列重投 3 轮 → 死信队列告警 | ⚠️ 该视频暂不在热时间线，冷区仍可查到；消息在 DLQ 可查可重投 |
-| 消息重试 5 次仍失败 | 转 `failed` 终态 + 打日志 | ⚠️ 需人工介入，不会无限重投 |
+| Redis 宕机期间消费消息 | 本地 1 次重试 → 重试队列重投 3 轮 → DLQ 落 `dead_letters` + 告警 | ⚠️ 该视频暂不在热时间线，冷区仍可查到；消息可按 `event_id` 查到 |
+| ZSET 非空但少了几条 member | 空判定不触发；5 分钟对账比较 MySQL 最新 1000 条与 ZSET，只补缺失 | ⚠️ 最多延迟 5 分钟恢复；期间该视频冷区可查 |
+| 视频删除后 `ZREM` 失败 | 删除不回滚；读路径 `GetVideoByIDs` 装配时过滤查不到的 ID；残留 member 会被后续写入的 rank 裁剪挤出 | ✅ 用户看不到已删视频；最多浪费几个热区名额，不影响正确性 |
+| 消息重试 5 次仍失败 | 转 `failed` 终态 + `[ALERT]` 日志 | ⚠️ 可通过 `/admin/outbox/failed` 查看、`/replay` 重放 |
 
 ---
 
@@ -574,7 +729,7 @@ Outbox 的思路是**降维**：既然跨系统没法原子，就把「要发的
 **完整回答**：
 1. **投递延迟**：轮询间隔就是延迟下界。本项目 1s 轮询，所以发布后约 1 秒才进时间线。这是我用「发布写库的原子性」换来的，产品上（作者发布后自己刷新、粉丝刷 Feed）完全可接受。
 2. **DB 压力**：每秒一次 `SELECT`。缓解手段是**批量取 100 条** + **失败退避**（`next_retry_at` 到点才可见）+ 状态字段有索引。没有退避的话，MQ 一挂就会变成每秒 100 条失败重试的空转风暴。
-3. **表增长**：消息发成功不能删（否则没有审计和重试依据），所以改成 `sent` 状态 + 24 小时后 `PurgeSent` 清理。
+3. **表增长**：消息发成功不能删（否则没有审计和重试依据），所以改成 `sent` 状态 + 24 小时后 `PurgeSent` 清理。清理按 1000 条/批循环删除，避免一条大 `DELETE` 形成长事务和主从延迟。
 
 **加分点**：延迟想更小可以降低轮询间隔到 100ms，但 DB 压力涨 10 倍，属于典型的吞吐/延迟取舍；真要毫秒级就上 CDC（见 Q14）。
 
@@ -608,7 +763,7 @@ Outbox 的思路是**降维**：既然跨系统没法原子，就把「要发的
 
 AMQP 事务（`tx_select / tx_commit`）是「多条消息要么都发成功要么都不发」，每批都要多轮网络往返，吞吐量大约掉一到两个数量级。而 confirm 是**单条粒度**、异步回执，可以流水线化，性能损失很小。
 
-**加分点**：confirm 有两种用法——同步等（本项目，每发一条等一次，简单但吞吐低）和批量等（发 N 条后一起等，吞吐高但要处理失败重发）。时间线发布 QPS 很低，所以选了最简单的同步等。
+**加分点**：confirm 有两种用法——同步等（本项目，每发一条用 `PublishWithDeferredConfirm` 等一次，按 `DeliveryTag` 精确匹配）和批量等（发 N 条后一起等，吞吐高但要处理失败重发）。时间线发布 QPS 很低，所以选了最简单也最精确的同步等。
 
 ---
 
@@ -639,15 +794,23 @@ AMQP 事务（`tx_select / tx_commit`）是「多条消息要么都发成功要�
 **要点**：这是明确的容量取舍，不是缺陷。1000 条之后走 MySQL + 索引游标，性能仍可接受。
 
 **完整回答**：
-`ZREMRANGEBYRANK key 0 -1001` 每次写入后裁掉最老的，只留最近 1000 条。选 1000 的考虑：
+写入时用一段 Lua 同时做 `ZADD` 和 `ZREMRANGEBYRANK key 0 -(capacity+1)`，只留 score 最大的 1000 条：
+
+```lua
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -(tonumber(ARGV[3]) + 1))
+return redis.call('ZCARD', KEYS[1])
+```
+
+选 1000 的考虑：
 
 - **内存可控**：一条 member 是数字 ID，1000 条在几十 KB 量级，即使未来按标签/分频道扩展多个 ZSET 也不心疼。
 - **热区的定义**：绝大多数用户刷 Feed 不会翻过前几屏，1000 条覆盖绝大部分真实请求。
-- **超出后的代价可接受**：翻出热区就走 `WHERE create_time < ? ORDER BY create_time DESC LIMIT ?`，有 `idx_videos_create_time` 索引，代价是常数级的，不会劣化。
+- **超出后的代价可接受**：翻出热区就走 `WHERE (create_time < ?) OR (create_time = ? AND id < ?) ORDER BY create_time DESC, id DESC LIMIT ?`，配合 `idx_videos_create_time`，代价也是索引 seek，不会随页码劣化。
 
 真正的代价是**热区覆盖率有限**——如果站点发布量很大（比如每秒几十条），1000 条可能只覆盖几分钟，热区命中率就很低了。这种情况下应该按发布速率动态调容量，或者干脆改成「按时间而非按条数」裁剪。
 
-**加分点**：这个数字必须是**可配置的常量**而不是散落的魔法数字，要根据线上发布 QPS 定期回看。
+**加分点**：容量必须是**一个可配置常量**而不是散落的魔法数字。这里抽成了 `video.TimelineCapacity = 1000`，写入裁剪、空 ZSET 重建、后台对账三处共用同一个值——任何一处漏改，都会出现「刚重建就被裁掉」或「对账补完又超量」的抖动。
 
 ---
 
@@ -660,7 +823,11 @@ AMQP 事务（`tx_select / tx_commit`）是「多条消息要么都发成功要�
 1. **无 publisher confirm**：`PublishJSON` 发出就当成功，紧接着 `db.Delete(&msg)`。broker 未落盘时消息永久丢失且无法补回。**修复**：通道开启 confirm，收到 ACK 才置 `sent`。
 2. **无状态机/抢占**：`SELECT * WHERE status='pending' LIMIT 100` 后直接发，多实例部署会各发一遍。**修复**：加 `processing` 中间态 + CAS 抢占 + `claimed_at` 崩溃回收。
 3. **poller 一次性判空**：启动时 `tmq == nil` 就 `return`，MQ 恢复后积压消息永远不投递，必须重启 API。**修复**：改成循环内周期性重建，恢复即补发。
-4. **消费端无限 requeue / 静默丢弃**：`Nack(false, true)` 无次数上限，Redis 故障期间消息被打成死循环；后来改成「重试 3 次后 Ack 丢弃」又走向另一个极端，把 at-least-once 在最后一环丢掉了。**修复**：复用统一 `Consumer` 骨架，改成三级容错（进程内退避 → 重试队列 TTL 重投 → 死信队列告警），全程不静默 Ack 失败消息。
+4. **消费端无限 requeue / 静默丢弃**：`Nack(false, true)` 无次数上限，Redis 故障期间消息被打成死循环；后来改成「重试 3 次后 Ack 丢弃」又走向另一个极端，把 at-least-once 在最后一环丢掉了。**修复**：复用统一 `Consumer` 骨架，改成三级容错（进程内退避 → 重试队列 TTL 重投 → 死信队列落表告警），全程不静默 Ack 失败消息。
+
+**第三轮又补了四个**：发布端退避加 ±30% 抖动；broker/连接级故障分流到 `MarkDeferred`（不再烧重试额度）；confirm 改成 `DeferredConfirmation` 按 `DeliveryTag` 精确匹配；`failed` 增加周期统计、`[ALERT]`、`/admin/outbox/*` 查询与重放。这些不再是「最初实现的缺陷」，而是从「能跑」到「可运维」的补齐。
+
+**第四轮修的是查询侧**：原子写入裁剪、复合游标、`has_more` 探测、缝合补数、删除 `ZREM`、5 分钟对账（详见第 9 节与第 13 节）。它们不在投递链路上，但同样是「文档里成立、代码里不成立」的反推结果——比如旧代码的注释写着「严丝合缝」，实际跨边界那页的 `has_more` 是错的。
 
 **发现方式**：对着「降级/最终一致」的叙事逐条反推故障场景——MQ 挂、Redis 挂、多实例、进程崩溃——看代码在每种情况下到底会怎样。凡是「只在文档里成立、代码里不成立」的，都是漏洞。
 
@@ -713,14 +880,24 @@ WHERE id=? AND status='pending';   -- 只有这一条语句加锁
 
 ### Q10：confirm 超时之后，为什么要重建 channel？
 
-**要点**：超时后迟到的 ACK 可能错位到下一条消息；重建 channel 可以彻底清掉这个歧义。
+**要点**：超时不再有「ACK 错位」问题——每条消息按 `DeliveryTag` 精确等待；但超时通常意味着连接级故障，重建 channel 是为了把后续消息从坏连接上挪开。
 
 **完整回答**：
-我的 `waitConfirm` 是「取下一条确认」，而不是精确匹配 `DeliveryTag`（前提是 `PublishVideo` 串行调用）。如果第 N 条超时了，它的 ACK 可能在第 N+1 条发布之后才到——那时我会把这个迟到的 ACK **误当成第 N+1 条的确认**，于是第 N+1 条明明没落盘却被判成功，就又回到「以为成功实则丢失」的老问题。
+旧实现是 `NotifyPublish` + 「取下一条确认」：第 N 条超时后，迟到的 ACK 可能被第 N+1 条误认，所以必须重建 channel 来作废旧确认。这是当时的简化，前提是发布串行。
 
-所以策略是：**一旦超时或 NACK，就把 channel 置为不可用并重建**。重建后迟到的确认随旧 channel 一起作废，不会污染后续判断。同时这条消息已经 `MarkRetry`，会在退避后重新投递，不会丢。
+现在改成 `PublishWithDeferredConfirm`：每条消息拿到独立的 `DeferredConfirmation`，`WaitContext` 只等自己的 `DeliveryTag`。即使第 N 条的 ACK 迟到，也只会落在第 N 条上，不会污染第 N+1 条。
 
-**加分点**：如果想做得更严谨，可以在发布前记录 `ch.NotifyPublish` 里的 `DeliveryTag` 做精确匹配（amqp091-go 的 `PublishWithDeferredConfirm` 就是干这个的）。本项目发布是串行、QPS 很低，用简化版足够，但我清楚它的前提和失效边界——**知道自己的简化在哪、什么时候会失效**，比盲目套复杂方案重要。
+那为什么还要重建？两个原因：
+
+1. confirm 超时 / publish I/O 失败 / channel 关闭都被归类为 `ErrBrokerUnavailable`，说明**连接本身可能已经不可用**。继续用同一条 channel 发本批剩余消息，只会连续失败；
+2. channel 关闭时 amqp 库会把所有未决确认置为 NACK；重建可以避免把一堆已失效的确认留在内存里。
+
+两者职责已经分开：
+
+- **broker 级故障** → `MarkDeferred` + `Close()` + `break` 本批，下一轮重建；
+- **消息级 NACK** → 只 `MarkRetry` 当前条，**不重建 channel**，继续处理本批。
+
+**加分点**：精确匹配解决的是「确认归属」，重建解决的是「连接健康」，不是同一件事。旧答案把两者绑在一起，是因为旧实现依赖「串行 + 重建」规避错位；现在拆开了。
 
 ---
 
@@ -732,8 +909,12 @@ WHERE id=? AND status='pending';   -- 只有这一条语句加锁
 `LIMIT 10 OFFSET 100000` 的执行过程是：先取出 100010 行，丢弃前 100000 行，返回 10 行。翻到第 10000 页时数据库要做十万行量级的无用功。
 
 ```sql
--- 游标写法：直接定位，代价与页码无关
-SELECT * FROM videos WHERE create_time < ? ORDER BY create_time DESC LIMIT 10;
+-- 复合游标写法：直接定位，代价与页码无关
+SELECT * FROM videos
+WHERE create_time < ?
+   OR (create_time = ? AND id < ?)
+ORDER BY create_time DESC, id DESC
+LIMIT 10;
 ```
 
 配合 `idx_videos_create_time` 索引，第 1 页和第 10000 页的代价几乎一样。
@@ -741,26 +922,31 @@ SELECT * FROM videos WHERE create_time < ? ORDER BY create_time DESC LIMIT 10;
 **更隐蔽的问题是翻页错乱**：用户看第 1 页时，有人发布了 3 条新视频。翻第 2 页时：
 
 - OFFSET：整体后移 3 位，第 2 页开头会**重复**第 1 页末尾的 3 条
-- 游标：`create_time < 上一页最后一条`，新数据插在游标之前，**不参与后续分页**，不重复也不漏
+- 游标：新数据插在游标之前，**不参与后续分页**，不重复也不漏
 
-本项目热区用 `ZREVRANGEBYSCORE` + `reqTime-1`（严格小于），冷区用 `create_time < ?`，两端都是游标语义。
+**为什么必须是复合游标**：只用 `create_time`，同一毫秒有多条视频时，`create_time < ?` 会把同毫秒的其余条目全部跳过——漏数据。热榜早就用了 `(popularity, id)`，时间线现在也统一到 `(create_time, id)`：
 
-**加分点**：单用 `create_time` 在同一毫秒有多条时会不稳定（可能漏掉同毫秒的另一条）。工业做法是**复合游标** `(create_time, id)`，本项目热榜就是这么做的（`latestPopularity + latestIDBefore`）。时间线这边还只用 `create_time`，是已知的简化项。
+- 冷区：`WHERE create_time < ? OR (create_time = ? AND id < ?)`，严格按 `(create_time DESC, id DESC)` 排序，与热区、索引定义三处一致；
+- 热区：不能直接对 ZSET 做「字典序小于某 id」的范围查询，所以改成 **`maxScore = reqTime`（包含等号）+ 应用层过滤**——先用 `ZCOUNT key reqTime reqTime` 算出同毫秒条数，一次性取回，再在内存里过滤掉 `score == reqTime && id >= cursor.ID` 的成员，最后按 `(score DESC, id DESC)` 排序截断。
+
+**代价**：同毫秒的条数不可控，`ZCOUNT` 存在的意义就是把「要拉多少条」提前算出来，避免少取导致漏项。正常发布速率下同毫秒只有个位数，代价可以忽略；极端刷量场景下这一页会变重，但不会错。
 
 ---
 
 ### Q12：冷热边界怎么缝合？为什么冷数据不回填缓存？
 
-**要点**：热区取不满 limit 时，用热区最后一条的 `CreateTime` 当冷游标去 MySQL 补齐；补齐结果**不写回 ZSET**。
+**要点**：热区取不满时，用热区最后一条的 `(CreateTime, ID)` 当冷游标去 MySQL 补齐；补齐结果**不写回 ZSET**；冷区查询失败要向上报错，不能静默返回短页。
 
 **完整回答**：
 跨边界的那一页会走三步：
 
-1. 从 Redis 拿热区 ID 列表（`ZREVRANGEBYSCORE`），最多 `limit` 条；
-2. 如果不足 `limit` 条，说明这一页跨过了冷热边界，用**热区最后一条的 `CreateTime`** 作为冷游标去 MySQL 补 `limit - len` 条；
-3. 拼接返回。
+1. 从 Redis 拿热区 ID 列表（`ZREVRANGEBYSCORE`），目标是 `want := limit + 1` 条——多取的一条只用于探测 `has_more`；
+2. 如果不足 `want` 条，说明这一页跨过了冷热边界，用**热区最后一条的复合游标** `(CreateTime, ID)` 去 MySQL 补 `want - len(baseVideos)` 条；
+3. 拼接后判断 `hasMore := len(baseVideos) > limit`，截断到 `limit` 返回；游标取**实际返回的最后一条**，而不是多取的那条。
 
 关键点在**不回填**：如果不小心把补齐的冷数据写回 ZSET，那么任何用户多翻几页，就能把大量历史数据灌进只保留 1000 条的热池，**把真正的新视频挤出去**——这就是「冷数据污染热点池」。一次误操作就能让热区的命中率归零。
+
+**只缝一次就够了**：冷区是 MySQL 全量数据，热区是它的子集，且冷区查询没有任何后置过滤（不像关注流还要按关注关系筛）。所以跨过边界后，剩余部分一定全部命中冷区，不存在「冷区再跨回热区」的可能。反过来，如果冷区查询失败，正确做法是**把错误抛给调用方**，让客户端重试——静默返回一个短页，用户会以为没数据了，这种「看起来成功」的降级比报错更有害。
 
 **加分点**：判断走热区还是冷区的依据，是**请求游标与 ZSET 最老一条 score 的比较**：
 
@@ -768,22 +954,27 @@ SELECT * FROM videos WHERE create_time < ? ORDER BY create_time DESC LIMIT 10;
 if reqTime <= watermark { /* 冷区：查 MySQL */ } else { /* 热区：查 Redis */ }
 ```
 
-这个 `watermark` 是动态计算出来的，不需要维护额外的元数据——ZSET 本身的状态就是冷热边界。
+这个 `watermark` 是动态计算出来的，不需要维护额外的元数据——ZSET 本身的状态就是冷热边界。之所以用 `<=` 而不是 `<`：裁剪是按 rank 切的，同一毫秒的成员可能被切成两半，剩下那半条 score 正好等于水位线，必须去 MySQL 才能把同毫秒的其余条目补齐。
 
 ---
 
 ### Q13：Redis 全挂了 Feed 还能用吗？ZSET 空了怎么重建？
 
-**要点**：能。`rediscache == nil` 或 ZSET 查询报错都直接降级 `listLatestFromDB`；ZSET 为空时用 singleflight 从 MySQL 拉最新 1000 条重建。
+**要点**：能。`rediscache == nil` 或 ZSET 查询报错都直接降级 `listLatestFromDB`；ZSET 为空时用 singleflight 从 MySQL 拉最新 1000 条重建；只丢了一部分时靠 5 分钟对账补齐。
 
 **完整回答**：
-三层降级：
+四层自愈，按「丢失程度」递进：
 
 1. **Redis 整体不可用**：`ListLatest` 开头判断 `f.rediscache == nil`，直接走 `listLatestFromDB`，纯 MySQL 游标查询，服务可用（慢一些）。
 2. **Redis 超时/报错**：取 `zsetTail` 出错也降级走 DB，不会把错误抛给用户。
-3. **ZSET 还是空的**（冷启动 / Redis 被清）：触发重建——用 singleflight 保证只有一个请求去重建，从 MySQL 拉最新 1000 条 `ZADD` 回 ZSET，其余请求等待；如果 DB 也是空的，返回 `EMPTY_DB` 哨兵**防无限递归**。
+3. **ZSET 是空的**（冷启动 / Redis 被清）：触发重建——用 singleflight 保证只有一个请求去重建，从 MySQL 拉最新 `TimelineCapacity` 条 `ZADD` 回 ZSET，其余请求等待；如果 DB 也是空的，返回 `EMPTY_DB` 哨兵**防无限递归**。
+4. **ZSET 非空但少了几条**（消费端进了死信、Lua 执行中断、运维误删）：空判定不会触发，靠**每 5 分钟一次的对账**——读 MySQL 最新 1000 条与 ZSET 成员做差集，**只补缺失的，不按差集删除多出来的**（补完再按容量裁剪一次，维持 1000 条上限）。
 
-**加分点**：空 ZSET 重建最怕的是「DB 也没数据 → 重建失败 → 又判定为空 → 再重建」的递归死循环，代码里用 `EMPTY_DB` 哨兵值显式切断了这个环。写这类「自愈」逻辑时，**先想清楚自愈条件永远不满足时会怎样**。
+**删除的对称处理**：视频被删除时，`Delete` 除了删 DB 行、失效实体缓存，还会尽力 `ZRem` 热时间线（100ms 超时）。Redis 失败不回滚删除——DB 才是源数据，读路径会过滤查不到的 ID，5 分钟对账也不会把它加回来（MySQL 里已经没有这条了）。残留成员不会被对账主动删除（对账只补不删），最终靠后续写入的 rank 裁剪自然挤出，这段时间只是浪费几个热区名额，不影响正确性。
+
+**加分点**：对账为什么「只补不删」？因为对账用的是 MySQL 的**某个时刻快照**，而对账执行期间可能刚有新视频发布进 ZSET、还没进快照。此时「ZSET 有、快照没有」不代表多余，删掉就是误伤。补是安全的（幂等 `ZADD`），删是不安全的——**自愈逻辑要优先选择幂等且可重入的方向**。
+
+另外要能说清对账的**检测窗口**：它每 5 分钟跑一次，意味着部分丢失最多 5 分钟不可见。这是有意的取舍——为几条派生数据做实时校验，成本远高于收益；而源数据本身有 Outbox 保证，不会丢。
 
 ---
 
@@ -805,9 +996,9 @@ if reqTime <= watermark { /* 冷区：查 MySQL */ } else { /* 热区：查 Redi
 **要点**：分三层——先靠清理压住存量，再靠索引/分区保证查询不劣化，最后才考虑归档分表。
 
 **完整回答**：
-1. **控制存量**：已经发送的消息不需要永久保留。`PurgeSent` 每 10 分钟清理 24 小时前的 `sent` 记录，稳态下表里只有「未投递 + 近一天已投递」，行数与**投递速率**相关而不是与**历史总量**相关。
+1. **控制存量**：已经发送的消息不需要永久保留。`PurgeSent` 每 10 分钟清理 24 小时前的 `sent` 记录，按 1000 条/批循环删除，稳态下表里只有「未投递 + 近一天已投递」，行数与**投递速率**相关而不是与**历史总量**相关。
 2. **保证查询不劣化**：热查询是 `WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY id LIMIT 100`，需要 `(status, next_retry_at, id)` 的复合索引；`CountPending` 走 `status` 索引。只要行数在索引可控范围内，查询代价与总量无关。
-3. **归档**：`failed` 是终态，长期堆积说明有系统性问题，应该告警 + 人工处理后归档到历史表。
+3. **归档**：`failed` 是终态，长期堆积说明有系统性问题。现在有 `failed > 0` 告警 + `/admin/outbox/failed` 查询 + `/replay` 重放；但**历史归档表还没做**，长期存量仍要靠人工重放/清理。
 4. **分区**：真到千万级，按 `create_time` 做范围分区，清理直接 `DROP PARTITION`，比 `DELETE` 快几个数量级。
 
 **加分点**：不要一上来就说分库分表。Outbox 的特点是**稳态行数很低**（消息发完就清），真正会撑爆它的只有「投递长时间失败」这种异常场景——那本身就应该告警，而不是靠扩容掩盖。
@@ -853,22 +1044,28 @@ if reqTime <= watermark { /* 冷区：查 MySQL */ } else { /* 热区：查 Redi
 
 ### Q18：这个模块你怎么观测和告警？
 
-**要点**：Outbox 的最大优势就是状态在数据库里，一条 SQL 就能观测。
+**要点**：Outbox 的状态在数据库里，一条条件聚合 SQL 就能拿到全部核心指标；本项目已把统计、`/metrics` gauge、`[ALERT]` 日志和管理接口全部落地。
 
 **完整回答**：
-基于 `outbox_msgs` 表就能做出核心指标（仓库里已经备了 `CountPending`）：
+`OutboxRepository.Stats` 用一条 SQL 同时算出 pending / processing / failed / stuck / 最老 pending / 最大重试次数，poller 每分钟调用一次：
 
-| 指标 | 查询 | 告警阈值 |
+| 指标 | 来源 | 告警阈值 |
 |---|---|---|
-| 积压量 | `COUNT(*) WHERE status='pending'` | 持续增长超过 N 分钟 → poller 或 MQ 有问题 |
-| 卡死量 | `COUNT(*) WHERE status='processing' AND claimed_at < now-60s` | > 0 持续 → 有实例崩溃或处理卡住 |
-| 失败量 | `COUNT(*) WHERE status='failed'` | > 0 → 立刻告警，需人工介入 |
-| 最老积压时长 | `MIN(create_time) WHERE status='pending'` | 超过阈值 → 投递链路断了 |
-| 峰值重试次数 | `MAX(retry_count) WHERE status='pending'` | 接近 5 → 即将转 failed |
+| 积压量 | `SUM(status='pending')` | 持续增长超过 N 分钟 → poller 或 MQ 有问题 |
+| 卡死量 | `SUM(status='processing' AND claimed_at < now-60s)` | > 0 → 立刻 `[ALERT]` |
+| 失败量 | `SUM(status='failed')` | > 0 → 立刻 `[ALERT]`，需人工介入 |
+| 最老积压时长 | `MIN(create_time) WHERE status='pending'` | 超过 5 分钟 → `[ALERT]`，投递链路可能断了 |
+| 峰值重试次数 | `MAX(retry_count)` | 接近 5 → 即将转 failed |
 
-消费端还可以记「丢弃计数」（重试 3 次后丢弃的次数），这个指标持续大于 0 说明 Redis 有问题。
+三路输出：
 
-**加分点**：把「失败」显式建模成 `failed` 终态而不是「重试几次然后静默丢弃」，是为了**让问题可见**。静默丢弃是可靠性设计里最坏的一种——你连它发生过都不知道。
+1. **日志**：异常时打 `[ALERT]` 前缀，日志采集可直接按关键字告警；
+2. **指标**：`feedsystem_outbox_messages{status="pending|processing|failed|stuck"}`、`feedsystem_outbox_oldest_pending_seconds` 写入内部观测端口的 `/metrics`（与 pprof 共用，不暴露在业务端口）；
+3. **接口**：`GET /admin/outbox/stats`、`GET /admin/outbox/failed`、`POST /admin/outbox/replay`（`X-Admin-Token` 保护，仅在配置 `ADMIN_TOKEN` 时注册）。
+
+消费端通过统一 `Consumer` 骨架打点：`feedsystem_consumer_processed_total{result}`、`feedsystem_consumer_retry_total`、`feedsystem_consumer_deadletter_total`、`feedsystem_dlq_consumed_total`。
+
+**加分点**：把「失败」显式建模成 `failed` 终态而不是「重试几次然后静默丢弃」，是为了**让问题可见**。更进一步是让它**可干预**——能查、能重放，才算闭环。
 
 ---
 
@@ -878,14 +1075,36 @@ if reqTime <= watermark { /* 冷区：查 MySQL */ } else { /* 热区：查 Redi
 
 **完整回答**（主动暴露问题比被追问出来好得多）：
 
-1. **`failed` 状态没有运维出口**：目前只能 `SELECT` 手工查，缺后台管理接口和告警。
-2. **退避没有 jitter**：多实例同时重试会形成尖峰，应该加 ±30% 随机抖动打散。
-3. **消费端重试是进程内阻塞**：`sleep(1s/2s/4s)` 会卡住该消费者整条流（QoS=10）。要优雅就得上延迟队列（TTL + DLX）。
-4. **游标不够稳**：`ListLatest` 只用 `create_time`，同毫秒多条时可能漏项，应改成 `(create_time, id)` 复合游标（热榜已经是这么做的）。
-5. **confirm 匹配是简化版**：串行前提下的「取下一条确认」，若要并发发布需改成 `DeferredConfirmation` 精确匹配 DeliveryTag。
-6. **删除视频不会从 ZSET 移除 member**：被删视频的 ID 仍留在时间线里，靠 `GetVideoByIDs` 回源时过滤掉，不影响正确性，但会轻微影响当页条数。
-7. **死信队列缺运维出口**（DLX 绑定错误已修）：所有 `<queue>.dlx` 曾用 `#` 绑到同一个 DLX exchange，死信会被广播到所有 DLX 队列 —— 已改成精确路由键。但 DLQ 目前只打日志，还缺告警和按 `event_id` 重投的管理接口。
-8. **回收（ReapStuck）不区分「崩溃」与「慢」**：现在靠 60s 租约一刀切，慢的实例会被误回收导致重复投递。生产做法应该是租约续期（处理中定期刷新 `claimed_at`）。
+**已解决（第三轮，可运维性）**：
+
+- `failed` 有周期统计、`[ALERT]`、`/admin/outbox/failed` 查询和 `/admin/outbox/replay` 重放；
+- 发布端退避已加 ±30% 抖动；
+- confirm 已改成 `DeferredConfirmation` 按 `DeliveryTag` 精确匹配，不再依赖串行前提；
+- DLX 绑定已改成精确路由键；DLQ 消费者会落 `dead_letters` 表并打指标。
+
+**已解决（第四轮，冷热分离查询）**：
+
+- 写入 + 裁剪合并成一段 Lua，`TimelineCapacity` 三处共用，不再出现「重建完立刻被裁」；
+- 时间线游标统一成 `(create_time, id)` 复合游标，同毫秒不再漏项；热区用 `maxScore = reqTime` + `ZCOUNT` 同分条数 + 应用层按 id 过滤；
+- `has_more` 改为「多取一条」独立探测，跨冷热边界那页不再误报；
+- 缝合用复合冷游标、`want - len` 精确补数，冷区查询失败直接报错而不是静默返回短页；
+- 删除视频时尽力 `ZRem` 热时间线；关注流从「整页结果缓存 24h」改为**只缓存 ID 页 + 游标**，内容命中后重新装配，TTL **首页 30s、后续页 24h**（新视频只影响首页）；
+- 新增每 5 分钟对账，补齐 ZSET 部分丢失（只补不删）。
+
+**仍然存在的边界**：
+
+1. **消费端仍有一次进程内阻塞重试**：默认骨架 1+3 次；时间线已降为 `MaxLocalRetries=1`，但这一条失败消息仍会短暂阻塞 QoS=10 的流。更彻底的做法是本地 0 次、直接进 TTL 重试队列。
+2. **回收不区分「崩溃」与「慢」**：60s 租约一刀切，慢实例会被误回收导致重复投递。生产应做租约续期（处理中定期刷新 `claimed_at`）。
+3. **DLQ 没有自动重放工具**：消息已落表、可按 `event_id` 查询，但重投仍要人工把消息体重新发布回主交换机；自动重放有毒消息只会形成「进死信 → 重放 → 再进死信」的循环。
+4. **`failed` 没有历史归档**：长期失败的存量仍要靠人工重放/清理；千万级时还需要按时间分区。
+5. **永久性拓扑损坏只会告警，不会终态化**：交换机/队列被误删时消息会一直 `pending`，由「最老 pending > 5min」的 `[ALERT]` 发现，而不是自动转 `failed`。
+6. **`mandatory=false` 的不可路由消息会被 broker ACK**：本地会标 `sent`。要堵住需要 `mandatory=true + NotifyReturn`。
+7. **轮询仍是固定 1s**：自适应轮询、Redis 信号、CDC 都还在路线图里，没有实现。
+8. **部分丢失有 5 分钟检测窗口**：对账不是实时校验，这段时间内热区会缺几条，用户翻到冷区可见。为派生数据做实时校验不划算。
+9. **冷区 `OR` 条件要靠 `EXPLAIN` 兜底**：`create_time < ? OR (create_time = ? AND id < ?)` 在 MySQL 8 上通常能走 range + index merge，但这依赖优化器；上线前必须 `EXPLAIN ANALYZE` 确认没有退化成分组扫描 + filesort。
+10. **热区同毫秒条数没有上界**：`ZCOUNT` 会把整毫秒的成员一次性拉回内存做 id 过滤。正常发布速率下是个位数，但刷量场景下这一页会明显变重；要彻底解决得改 score 编码（如 `create_time * 1000 + seq`）或改用复合 member。
+11. **容量是静态的、且只有一个全局 ZSET**：1000 条按发布速率换算成时间窗口会浮动，高发布量下热区可能只覆盖几分钟；也不支持按标签/关注流分片。真要做需要动态容量 + 多 ZSET。
+12. **关注流仍是读扩散**：`author_id IN (子查询)` 在关注数大时扫描量不可控。取关会主动 `DelByPattern` 清掉该账号的 ID 页缓存，正常路径立即生效；剩余窗口是「并发回填竞态」——一个已经在查库的请求可能把旧 ID 页写回，按页 TTL 收敛（首页 30s、深层页 24h）。写扩散（推模式）是另一个量级的改造，本项目没做。
 
 ---
 
@@ -921,7 +1140,7 @@ if reqTime <= watermark { /* 冷区：查 MySQL */ } else { /* 热区：查 Redi
 | **A. 自适应轮询** | 查到 0 条就指数放大间隔（1s→2s→4s→封顶 5s），查到数据立刻回落 | 空闲期 DB 查询降到 1/5，多实例同比例放大收益 | 无（延迟上界变 5s，但没消息时空转本就无价值） |
 | **B1. 批量 Claim** | 短事务里 `SELECT ... FOR UPDATE SKIP LOCKED` + 一条批量 UPDATE | 100 次 UPDATE → 2 次 SQL | 需 MySQL 8 |
 | **B2. 批量确认** | 一批发完统一 `UPDATE ... WHERE id IN (...)`，失败的行单独 `MarkRetry` | 再省一半往返 | 要处理部分成功 |
-| **B3. confirm 流水线** | 连发 N 条再统一收 N 个 ACK | 把 N×RTT 压成 1×RTT | 必须放弃「取下一条确认」的简化，改用 `map[DeliveryTag]` 精确匹配 |
+| **B3. confirm 流水线** | 连发 N 条再统一收 N 个 ACK | 把 N×RTT 压成 1×RTT | 单条精确等待已用 `DeferredConfirmation` 实现；要进一步流水线化，需要改成「先发 N 条、再按 `DeliveryTag` 收集 N 个结果」 |
 | **C. 查询优化** | 用 `visible_at` 哨兵值（默认 0）替掉 `OR ... IS NULL`，建 `(status, visible_at, id)` 复合索引 | 从逐行过滤变索引范围扫描，积压越重收益越大 | 字段语义微调 |
 | **D. id 水位线** | 记 checkpoint，`id > lastMaxID` 增量拉 | 不重复扫历史 | 需拆两条路：增量流 + 重试到期流 |
 | **E. Redis 信号** | 业务提交后 `LPUSH outbox_signal`；poller 用 `BRPOP` 阻塞，有信号才查库 | DB 压力≈0，毫秒级延迟 | 信号会丢，必须有兜底慢轮询（30s 全量扫） |
@@ -933,9 +1152,10 @@ if reqTime <= watermark { /* 冷区：查 MySQL */ } else { /* 热区：查 Redi
 
 | 阶段 | 动作 | 触发条件 |
 |---|---|---|
-| 现在 | A + C | 无条件，成本极低 |
+| 已完成 | B3 的精确 confirm（`DeferredConfirmation` + `DeliveryTag`） | — |
+| 现在 | A（自适应轮询）+ C（`visible_at` 哨兵） | 无条件，成本极低 |
 | 发布量上来 | B1 + B2（事务保持短） | 单批处理成瓶颈 |
-| 再往后 | B3（DeliveryTag 精确匹配） | 单条 RTT 成瓶颈 |
+| 再往后 | B3 流水线化（批量确认） | 单条 RTT 成瓶颈 |
 | Redis 已重度使用 | E（Redis 信号 + 30s 兜底） | 想压到近 0 |
 | 规模化 | F（CDC） | 秒级延迟不可接受 |
 
@@ -1006,12 +1226,12 @@ if err == nil {
 
 ```
 videos.CreateTime                                   ← 视频创建时间（MySQL datetime）
-   ↓ video_service.go:53-58  写进 OutboxMsg
+   ↓ video_service.go:62    写进 OutboxMsg（与 event_id 同事务）
 OutboxMsg.CreateTime
-   ↓ outboxworker.go:114     tmq.PublishVideo(pubCtx, msg.VideoID, msg.CreateTime)
+   ↓ outboxworker.go:140    tmq.PublishVideo(pubCtx, msg.VideoID, msg.CreateTime, eventID)
 TimelineEvent.CreateTime
-   ↓ timelineMQ.go:82        CreateTime: createTime.UnixMilli()   ← 转毫秒
-   ↓ outboxworker.go:257     Score: float64(event.CreateTime)
+   ↓ timelineMQ.go:111      CreateTime: createTime.UnixMilli()   ← 转毫秒
+   ↓ outboxworker.go:317-318    Lua: ZADD score=float64(event.CreateTime)
 ZSET score
 ```
 
@@ -1036,7 +1256,7 @@ feed:global_timeline
 **为什么用毫秒不用秒？**
 
 1. **同秒碰撞 → 排序错误**：score 相同时 ZSET 按 member **字典序**排列，`"10" < "9"`，顺序就错了。毫秒把碰撞概率压低三个数量级。
-2. **游标被"吃掉"**：游标分页用 `score < reqTime`，秒级精度下同秒的最后一条会把同秒其他条目全部排除，翻页直接漏数据。
+2. **游标被"吃掉"**：游标分页虽然用了 `maxScore = reqTime`（含等号）+ 应用层按 id 过滤，但同分的成员必须先全部取回才能过滤。秒级精度下同一秒可能有成百上千条，`ZCOUNT` 会把整秒的成员拉进内存，代价不可控。
 
 **float64 精度边界**：Redis ZSET score 是 IEEE 754 double，53 位有效位 ≈ `9.007e15`
 
@@ -1051,12 +1271,13 @@ feed:global_timeline
 
 | 用途 | 代码 |
 |---|---|
-| **排序取最新** | `ZREVRANGEBYSCORE key maxScore -inf LIMIT 0 limit` |
-| **裁剪 1000 条** | `ZREMRANGEBYRANK key 0 -1001`（保留 score 最大的 1000 条） |
+| **排序取最新** | `ZREVRANGEBYSCORE key maxScore -inf LIMIT 0 count` |
+| **裁剪 1000 条** | Lua 内 `ZREMRANGEBYRANK key 0 -(capacity+1)`（与 `ZADD` 原子执行） |
 | **冷热水位线** | `watermark := int64(zsetTail[0].Score)` |
-| **游标分页** | `maxScore = reqTime - 1`，严格小于防重复 |
+| **同分探测** | `ZCOUNT key reqTime reqTime`，决定热区一页要拉多少条 |
+| **游标分页** | `maxScore = reqTime`（含等号）+ 应用层过滤 `score == reqTime && id >= cursor.ID` |
 
-注意：**热区是「最近 1000 条」而不是「最近 N 小时」**，容量按条数封顶，所以 `watermark` 是随发布速率浮动的时间点——发布越频繁，热区覆盖的时间窗口越短。
+注意：**热区是「最近 1000 条」而不是「最近 N 小时」**，容量按条数封顶，所以 `watermark` 是随发布速率浮动的时间点——发布越频繁，热区覆盖的时间窗口越短。另外 score 只存了毫秒，`id` 并没有编码进 score，所以同毫秒的排序只能靠应用层补，这也是为什么热区分页不能做成纯 Redis 范围查询。
 
 ---
 
@@ -1064,7 +1285,7 @@ feed:global_timeline
 
 | # | 文件 | 改动 |
 |---|---|---|
-| 1 | `rabbitmq/timelineMQ.go` | 开启 publisher confirm + `waitConfirm` + `Close()` + `DeclareTimelineTopic()` |
+| 1 | `rabbitmq/timelineMQ.go` | 开启 publisher confirm + `waitConfirm`（第三轮已替换为 `PublishWithDeferredConfirm`）+ `Close()` + `DeclareTimelineTopic()` |
 | 2 | `video/video_entity.go` | 新增状态常量、`RetryCount / NextRetryAt / ClaimedAt / SentAt` 字段、`OutboxBackoff()` |
 | 3 | `video/outbox_repo.go` | 新增：`ListDue / Claim / MarkSent / MarkRetry / MarkFailed / ReapStuck / PurgeSent / CountPending` |
 | 4 | `worker/outboxworker.go` | poller 重写（CAS + 状态机 + 自愈 + 退避）；consumer 重写（拓扑声明 + 有限重试）；新增 `writeTimeline / zaddTimeline / sleepOrDone` |
@@ -1088,17 +1309,52 @@ feed:global_timeline
 > ⚠️ 上线注意：主队列新增了 `x-dead-letter-routing-key` 参数，已存在的队列会报
 > `PRECONDITION_FAILED (406)`，需要先删除旧队列（或改名）。
 
+### 第三轮改动（可运维性 + 故障分类）
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 14 | `video/video_entity.go` | `OutboxBackoff` 加 ±30% 抖动；新增 `OutboxBrokerRetryDelay = 5s`；`OutboxMsg` 新增 `LastError` |
+| 15 | `video/outbox_repo.go` | 新增 `MarkDeferred`（不烧额度）、`Stats`、`ListFailed`、`ReplayFailed`；`MarkRetry/MarkFailed/ReapStuck` 写 `last_error`；`PurgeSent` 改 1000 条/批循环 |
+| 16 | `rabbitmq/timelineMQ.go` | 改用 `PublishWithDeferredConfirm`；新增 `ErrBrokerUnavailable` / `ErrPublishRejected` 错误分类 |
+| 17 | `worker/outboxworker.go` | broker 级故障走 `MarkDeferred` 并重建 channel；每分钟 `Stats` + `[ALERT]`；时间线消费者 `MaxLocalRetries=1`；新增 `errText` |
+| 18 | `worker/retry.go` | `Consumer` 支持 `MaxLocalRetries`，不再写死 3 |
+| 19 | `http/outbox_admin.go` + `http/router.go` | 新增 `/admin/outbox/stats|failed|replay`，`X-Admin-Token` 常量时间校验 |
+| 20 | `config/loadconfig.go` + `cmd/main.go` | 新增 `ADMIN_TOKEN` 配置/环境变量并注入 router |
+| 21 | `worker/deadletter.go` + `worker/dlqworker.go` | DLQ 消费者把死信落 `dead_letters` 表（`(queue,event_id)` 唯一 + `INSERT IGNORE`），失败重试 3 次后 Ack |
+| 22 | `observability/metrics.go` | `/metrics` 输出 `feedsystem_outbox_*` gauge 与消费端计数 |
+
+> `last_error`、`dead_letters`、`ADMIN_TOKEN` 都随启动流程自动生效；`last_error` 由 `AutoMigrate` 自动加列。
+
+### 第四轮改动（冷热分离查询修复）
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 23 | `video/timeline.go`（新增） | 抽出 `TimelineCapacity = 1000` 与 `TimelineZSetKey`，写入、重建、对账三处共用 |
+| 24 | `worker/outboxworker.go` | `zaddTimeline` 改成一段 Lua：`ZADD` + `ZREMRANGEBYRANK 0 -(capacity+1)` + `ZCARD` 原子执行 |
+| 25 | `feed/entity.go` | 新增 `TimelineCursor{CreateTime, ID}`；响应新增 `has_more` |
+| 26 | `feed/repo.go` | `ListLatest` 改复合游标 `(create_time < ?) OR (create_time = ? AND id < ?)`，排序 `(create_time DESC, id DESC)` |
+| 27 | `feed/service.go` | `ListLatest` 改为 `want = limit+1` 探测 `has_more`；热区 `maxScore = reqTime` + `ZCOUNT` 同分条数 + 应用层 id 过滤；缝合用复合冷游标且冷区失败向上报错；新增 5 分钟对账 `StartTimelineReconciler`；关注流缓存只存 ID、首页 TTL 30s、`has_more` 用 `limit+1` |
+| 28 | `feed/handler.go` | 校验 `latest_time` / `latest_id_before` 必须成对出现，limit 做上限钳制 |
+| 29 | `video/video_service.go` | 删除视频后尽力 `ZRem` 热时间线（100ms 超时，失败不回滚） |
+| 30 | `middleware/redis/zset.go` | 新增 `ZRem`，移除重复的 `Exists` 声明 |
+| 31 | `http/router.go` | 启动时拉起 `StartTimelineReconciler`，周期 `5 * time.Minute` |
+
+> 复合游标上线后，旧客户端只传 `latest_time` 会被直接 400 拒绝（handler 强制两个字段成对且非零），不存在「悄悄退化成严格小于」的灰区——宁可让客户端立刻发现参数错了，也不要在同毫秒数据上静默漏项。对账任务只在 API 进程内跑，多实例会重复执行，但因为「只补不删 + `ZADD` 幂等」，重复执行无副作用。
+
 ---
 
 ## 14. 还没做的（下一步）
 
-按优先级：
+按优先级（与 Q19 一致）：
 
-1. **`failed` 状态缺少运维出口**：目前只能靠 `SELECT * FROM outbox_msgs WHERE status='failed'` 人工查，建议加一个后台管理接口或告警。
-2. **退避无 jitter**：多实例同时重试会产生尖峰，可加 ±30% 随机抖动。
-3. **进程内退避重试仍会阻塞该消费者**：`Consumer` 骨架里 1s/2s/4s 的退避会卡住这条流（时间线 QoS=10）。已有 TTL 重试队列兜底，但更优做法是降低第一级重试次数、尽早转重试队列。
-4. **游标不够稳**：`ListLatest` 只用 `create_time`，建议改成 `(create_time, id)` 复合游标，与热榜对齐。
-5. **死信队列缺运维出口**：DLX 绑定错误已修（精确路由键），但 DLQ 目前只打日志，还缺告警和按 `event_id` 重投的管理接口。
-6. **回收不区分「崩溃」与「慢」**：60s 租约一刀切，慢的实例会被误回收导致重复投递。生产应做租约续期。
-7. **`failed` 状态缺运维出口**：只能 `SELECT` 手工查，缺后台管理接口和告警。
-8. **退避无 jitter**：Outbox 的 `OutboxBackoff` 是纯指数退避，多实例同时重试会形成尖峰（消费端 `Consumer.backoff` 已加 jitter，poller 还没加）。
+1. **自适应轮询 + `visible_at` 哨兵**：空闲期把 DB 查询降到 1/5，并让 `ListDue` 稳定走索引范围扫描。零成本纯收益，优先级最高。
+2. **消费端本地重试降到 0**：时间线已经是 1+1，但这一条仍会短暂阻塞 QoS=10 的流；更进一步是本地不 sleep，直接进 TTL 重试队列。
+3. **租约续期**：60s 租约仍不区分「崩溃」与「慢」，慢实例会被误回收；生产应定期刷新 `claimed_at`。
+4. **DLQ 重放工具**：消息已落 `dead_letters`、可按 `event_id` 查询，但重投仍需人工。要做成工具的话必须带审计日志和限速，且**不要自动重放**——有毒消息会无限循环。
+5. **`failed` 历史归档 / 分区**：目前靠告警 + 人工重放控制存量；千万级时应归档到历史表或按 `create_time` 分区。
+6. **`mandatory=true + NotifyReturn`**：堵住 `mandatory=false` 下不可路由消息被 broker ACK、本地却标 `sent` 的洞。
+7. **永久性拓扑损坏的自动判定**：目前只会持续 `MarkDeferred` 并靠「最老 pending」告警；可增加「连续 N 次 broker 级失败且 pending 不降」的独立告警/熔断策略。
+8. **冷区执行计划要 `EXPLAIN` 兜底**：`create_time < ? OR (create_time = ? AND id < ?)` 依赖优化器选 range + index merge，上线前需 `EXPLAIN ANALYZE` 确认没有退化成分组扫描 + filesort；必要时改写成 `(create_time, id) < (?, ?)` 的元组比较。
+9. **热区同毫秒条数无上界**：`ZCOUNT` + 应用层过滤意味着刷量场景下一页会明显变重。彻底解法是把 id 编码进 score（如 `create_time * 1000 + seq`，需重新评估 float64 精度）或改成复合 member。
+10. **容量静态、只有单个全局 ZSET**：1000 条换算成时间窗口随发布速率浮动，也不支持按标签/关注流分片；要动态容量或多 ZSET 需要额外的元数据与裁剪策略。
+11. **关注流仍是读扩散 + 缓存成员**：`author_id IN (子查询)` 在关注数大时扫描量不可控；取关会主动清掉该账号的 ID 页缓存，但并发回填竞态仍可能把旧成员写回，按页 TTL 收敛（首页 30s、深层页 24h）。写扩散是另一个量级的改造，本项目没做。

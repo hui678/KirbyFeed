@@ -3,11 +3,13 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"math/rand"
 	"time"
 
 	"feedsystem_video_go/internal/middleware/rabbitmq"
+	"feedsystem_video_go/internal/observability"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -18,6 +20,11 @@ const (
 	maxLocalRetries = 3
 	baseBackoff     = time.Second
 	maxBackoff      = 8 * time.Second
+
+	// defaultProcessTimeout 是单条消息的处理上限。没有它，一条慢 SQL 会把整个
+	// 队列卡住：消费者是单 goroutine 串行的，后面的消息只能一起等。
+	// 超时按失败处理（进入退避重试），而不是静默跳过。
+	defaultProcessTimeout = 5 * time.Second
 )
 
 // RetryPublisher 把「进程内重试已耗尽」的消息交给重试队列延迟重投。
@@ -33,6 +40,12 @@ type Consumer struct {
 	Queue   string
 	Retry   RetryPublisher
 	Process func(ctx context.Context, d amqp.Delivery) error
+	// Timeout 是单条消息的处理上限，<=0 时用 defaultProcessTimeout。
+	Timeout time.Duration
+	// MaxLocalRetries 是「进程内」重试次数（不含首次处理），<=0 时用 maxLocalRetries。
+	// 时间线消费者把它设为 1：它在 QoS=10 的单条流里处理，本地 sleep 重试
+	// 会阻塞整条流，瞬时故障更应该尽早交给 TTL 重试队列。
+	MaxLocalRetries int
 }
 
 // Run 消费一个队列直到 ctx 结束或通道关闭。
@@ -68,30 +81,56 @@ func (c *Consumer) Run(ctx context.Context, ch *amqp.Channel) error {
 // 关键：任何时候都不 Ack 掉一条没处理成功的消息，这是「不静默丢消息」的底线。
 func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 	attempts := rabbitmq.GetRetryCount(d)
+	timeout := c.Timeout
+	if timeout <= 0 {
+		timeout = defaultProcessTimeout
+	}
+	maxLocal := maxLocalRetries
+	if c.MaxLocalRetries > 0 {
+		maxLocal = c.MaxLocalRetries
+	}
 
 	var lastErr error
-	for i := 0; i <= maxLocalRetries; i++ {
+	for i := 0; i <= maxLocal; i++ {
 		select {
 		case <-ctx.Done():
 			// 进程要退出了，把消息退回队列，交给下一个消费者或下次启动。
+			observability.Inc("feedsystem_consumer_requeue_total", "queue", c.Queue)
 			_ = d.Nack(false, true)
 			return
 		default:
 		}
 
-		err := c.Process(ctx, d)
+		// 每次尝试给独立预算：一条慢查询不能把整条队列的处理时间一起拖长。
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		err := c.Process(attemptCtx, d)
+		cancel()
 		if err == nil {
+			observability.Inc("feedsystem_consumer_processed_total", "queue", c.Queue, "result", "success")
 			_ = d.Ack(false)
 			return
 		}
-		lastErr = err
+		if ctx.Err() != nil {
+			// 超时也可能导致 err != nil，但父 ctx 只在退出时取消；退出优先。
+			observability.Inc("feedsystem_consumer_requeue_total", "queue", c.Queue)
+			_ = d.Nack(false, true)
+			return
+		}
 
-		if i == maxLocalRetries {
+		lastErr = err
+		if errors.Is(err, context.DeadlineExceeded) {
+			lastErr = fmt.Errorf("process timeout after %s: %w", timeout, err)
+		}
+		observability.Inc("feedsystem_consumer_processed_total", "queue", c.Queue, "result", "failure")
+
+		if i == maxLocal {
 			break
 		}
 		wait := backoff(i)
-		log.Printf("%s: 处理失败，%v 后重试 (%d/%d): %v", c.Name, wait, i+1, maxLocalRetries, err)
+		observability.Inc("feedsystem_consumer_retry_total", "queue", c.Queue)
+		log.Printf("%s: 处理失败，%v 后重试 (%d/%d): %v", c.Name, wait, i+1, maxLocal, lastErr)
 		if !sleep(ctx, wait) {
+			observability.Inc("feedsystem_consumer_requeue_total", "queue", c.Queue)
 			_ = d.Nack(false, true)
 			return
 		}
@@ -108,6 +147,7 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 		}
 	}
 
+	observability.Inc("feedsystem_consumer_deadletter_total", "queue", c.Queue)
 	log.Printf("%s: 重试 %d 轮仍失败，进入死信队列 %s: %v",
 		c.Name, attempts, rabbitmq.DLQQueueName(c.Queue), lastErr)
 	// requeue=false：消息走主队列的 x-dead-letter-exchange 进入专属死信队列。

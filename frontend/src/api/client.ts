@@ -49,7 +49,9 @@ async function tryRefresh(): Promise<string | null> {
       })
       if (!res.ok) { auth.clearTokens(); return null }
       const data = await res.json()
-      auth.setToken(data.token)
+      // 刷新会轮换 refresh token：必须把新的一起存下来，否则下一次刷新会用到旧票。
+      if (data.refresh_token) auth.setTokens(data.token, data.refresh_token)
+      else auth.setToken(data.token)
       return data.token as string
     } catch {
       auth.clearTokens()

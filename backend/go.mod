@@ -4,6 +4,7 @@ go 1.24.5
 
 require (
 	github.com/alicebob/miniredis/v2 v2.37.0
+	github.com/aliyun/aliyun-oss-go-sdk v2.2.9
 	github.com/gin-gonic/gin v1.11.0
 	github.com/go-sql-driver/mysql v1.8.1
 	github.com/golang-jwt/jwt/v5 v5.3.0

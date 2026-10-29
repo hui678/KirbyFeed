@@ -2,6 +2,7 @@ package video
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"gorm.io/gorm"
@@ -54,17 +55,31 @@ func (r *CommentRepository) ApplyPublish(ctx context.Context, comment *Comment) 
 	})
 }
 
-// ApplyDelete 删除评论。删除本身天然幂等：RowsAffected=0 说明已经删过了。
+// ApplyDelete 删除评论，并在同一事务里把 popularity 减回去。
+// 删除本身天然幂等：RowsAffected=0 说明已经删过了，此时绝不能再减热度。
 func (r *CommentRepository) ApplyDelete(ctx context.Context, commentID uint) error {
 	if commentID == 0 {
 		return nil
 	}
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 先取 video_id：删除之后就查不到了。
+		var comment Comment
+		if err := tx.Select("video_id").First(&comment, commentID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+
 		res := tx.Where("id = ?", commentID).Delete(&Comment{})
 		if res.Error != nil {
 			return res.Error
 		}
-		return nil
+		if res.RowsAffected == 0 {
+			// 并发删除或已删除：热度不能减第二次。
+			return nil
+		}
+		return bumpVideoColumn(tx, comment.VideoID, "popularity", -1)
 	})
 }
 

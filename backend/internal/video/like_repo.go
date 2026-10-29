@@ -11,15 +11,17 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// ApplyLike 是消费端唯一的点赞写入入口：插点赞行 + 累加计数放在同一个事务里。
+// ApplyLike 是消费端唯一的点赞写入入口：事件去重 + 插点赞行 + 累加计数放在同一个事务里。
 //
 // 为什么必须是事务：插行成功但计数失败的旧实现里，重试会命中唯一索引直接跳过，
 // 计数就再也补不回来 —— 一个「最终一致」的系统里最不该出现的就是这种永久偏差。
-// 事务让「行存在」和「计数已加」要么同时成立、要么都不成立，重试才是安全的。
+// 事务让「事件已处理」「行存在」「计数已加」要么同时成立、要么都不成立，重试才是安全的。
 //
-// 幂等：唯一索引 idx_like_video_account + INSERT IGNORE，重复投递时 RowsAffected=0，
-// 直接返回，不做任何副作用（计数也绝不能加第二次）。
-func (r *LikeRepository) ApplyLike(ctx context.Context, videoID, accountID uint) error {
+// 幂等两层：
+//  1. event_id 台账（like_events）挡住同一条事件的重投，包括「like 处理完、用户已取消、
+//     旧 like 被重投」这种唯一索引已经挡不住的复活；
+//  2. 唯一索引 idx_like_video_account + INSERT IGNORE 挡住不同事件但同一业务状态的重复。
+func (r *LikeRepository) ApplyLike(ctx context.Context, videoID, accountID uint, eventID string) error {
 	if videoID == 0 || accountID == 0 {
 		return nil
 	}
@@ -31,6 +33,14 @@ func (r *LikeRepository) ApplyLike(ctx context.Context, videoID, accountID uint)
 		if !exists {
 			// 视频已被删除：事件作废，Ack 掉即可，不算失败。
 			return nil
+		}
+
+		fresh, err := markLikeEvent(tx, eventID, videoID, accountID, "like")
+		if err != nil {
+			return err
+		}
+		if !fresh {
+			return nil // 同一条事件重投，已经生效过
 		}
 
 		res := tx.Clauses(clause.Insert{Modifier: "IGNORE"}).Create(&Like{
@@ -52,12 +62,21 @@ func (r *LikeRepository) ApplyLike(ctx context.Context, videoID, accountID uint)
 	})
 }
 
-// ApplyUnlike 与 ApplyLike 对称：删除行与减计数同事务，RowsAffected=0 表示幂等重复。
-func (r *LikeRepository) ApplyUnlike(ctx context.Context, videoID, accountID uint) error {
+// ApplyUnlike 与 ApplyLike 对称：事件去重 + 删除行 + 减计数同事务。
+// 删除的 RowsAffected=0 表示本来就没点赞（或已取消），不重复减计数。
+func (r *LikeRepository) ApplyUnlike(ctx context.Context, videoID, accountID uint, eventID string) error {
 	if videoID == 0 || accountID == 0 {
 		return nil
 	}
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		fresh, err := markLikeEvent(tx, eventID, videoID, accountID, "unlike")
+		if err != nil {
+			return err
+		}
+		if !fresh {
+			return nil
+		}
+
 		res := tx.Where("video_id = ? AND account_id = ?", videoID, accountID).Delete(&Like{})
 		if res.Error != nil {
 			return res.Error
@@ -70,6 +89,31 @@ func (r *LikeRepository) ApplyUnlike(ctx context.Context, videoID, accountID uin
 		}
 		return bumpVideoColumn(tx, videoID, "popularity", -1)
 	})
+}
+
+// markLikeEvent 在事务里占住 event_id。返回 false 表示这条事件已经处理过。
+// eventID 为空时退化为不去重（兼容历史消息），但新消息都会带 id。
+func markLikeEvent(tx *gorm.DB, eventID string, videoID, accountID uint, action string) (bool, error) {
+	if eventID == "" {
+		return true, nil
+	}
+	res := tx.Clauses(clause.Insert{Modifier: "IGNORE"}).Create(&LikeEventLog{
+		EventID:   eventID,
+		VideoID:   videoID,
+		AccountID: accountID,
+		Action:    action,
+		CreatedAt: time.Now(),
+	})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
+// PurgeLikeEvents 清理过期的去重台账，避免表随点赞量无限增长。
+func (r *LikeRepository) PurgeLikeEvents(ctx context.Context, before time.Time) (int64, error) {
+	res := r.db.WithContext(ctx).Where("created_at < ?", before).Delete(&LikeEventLog{})
+	return res.RowsAffected, res.Error
 }
 
 // bumpVideoColumn 原子自增/自减，并用 GREATEST 兜底不让计数变负。

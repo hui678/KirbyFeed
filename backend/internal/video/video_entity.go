@@ -1,6 +1,9 @@
 package video
 
-import "time"
+import (
+	"math/rand"
+	"time"
+)
 
 type Video struct {
 	ID          uint      `gorm:"primaryKey" json:"id"`
@@ -11,7 +14,7 @@ type Video struct {
 	PlayURL     string    `gorm:"type:varchar(255);not null" json:"play_url"`
 	CoverURL    string    `gorm:"type:varchar(255);not null" json:"cover_url"`
 	CreateTime  time.Time `gorm:"autoCreateTime;index:idx_videos_create_time,sort:desc;index:idx_videos_popularity_time_id,priority:2,sort:desc" json:"create_time"`
-	LikesCount  int64     `gorm:"column:likes_count;not null;default:0;index:idx_videos_likes_count_id,priority:1,sort:desc" json:"likes_count"`
+	LikesCount  int64     `gorm:"column:likes_count;not null;default:0" json:"likes_count"`
 	Popularity  int64     `gorm:"column:popularity;not null;default:0;index:idx_videos_popularity_time_id,priority:1,sort:desc" json:"popularity"`
 }
 
@@ -62,9 +65,15 @@ const (
 	OutboxClaimTimeout = 60 * time.Second
 	// OutboxSentRetention sent 状态的消息保留时长，之后由 PurgeSent 清理
 	OutboxSentRetention = 24 * time.Hour
+	// OutboxBrokerRetryDelay 是「broker/连接级故障」后的重新可见延迟。
+	// 这类故障不消耗 retry_count：MQ 整体不可用期间消息应该一直留在 pending 等恢复，
+	// 而不是每失败一次就烧掉一次额度、几十秒后被打成终态 failed。
+	OutboxBrokerRetryDelay = 5 * time.Second
 )
 
-// OutboxBackoff 计算第 retryCount 次重试前需要等待的时间（指数退避）
+// OutboxBackoff 计算第 retryCount 次重试前需要等待的时间。
+// 指数退避 + ±30% 抖动：多实例同时失败时避免在同一秒集体重试形成尖峰。
+// 例：第 1 次 1.4s~2.6s，第 2 次 2.8s~5.2s。
 func OutboxBackoff(retryCount int) time.Duration {
 	if retryCount <= 0 {
 		return 0
@@ -73,7 +82,12 @@ func OutboxBackoff(retryCount int) time.Duration {
 	if shift > 10 {
 		shift = 10
 	}
-	return OutboxBaseBackoff * time.Duration(1<<uint(shift))
+	base := OutboxBaseBackoff * time.Duration(1<<uint(shift))
+	delta := base * 3 / 10
+	if delta <= 0 {
+		return base
+	}
+	return base - delta + time.Duration(rand.Int63n(int64(2*delta)))
 }
 
 type OutboxMsg struct {
@@ -102,4 +116,8 @@ type OutboxMsg struct {
 	// 否则「worker A 卡住 → 被回收 → worker B 抢占 → A 恢复后把 B 的消息标成 sent」
 	// 会直接造成丢消息。见 outbox_repo.go 的 Claim。
 	ClaimToken *string `gorm:"size:64" json:"-"`
+
+	// LastError 保存最近一次投递失败/回收的原因，供告警、排查和人工重放时参考。
+	// 只保留最近一次；完整历史仍以日志为准。
+	LastError *string `gorm:"size:512" json:"last_error,omitempty"`
 }

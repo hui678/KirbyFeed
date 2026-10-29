@@ -9,6 +9,8 @@ import (
 	rabbitmq "feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/observability"
+	"feedsystem_video_go/internal/storage"
+	"feedsystem_video_go/internal/video"
 	"log"
 	"os"
 	"strconv"
@@ -76,6 +78,14 @@ func main() {
 		}
 	}
 
+	// 分片上传的临时目录和合并半成品需要有人回收：
+	// 会话过期后 tmp 目录不会自己消失，崩溃留下的 .mp4.part 也没人删。
+	if cache != nil {
+		cleanerCtx, cancelCleaner := context.WithCancel(context.Background())
+		defer cancelCleaner()
+		go video.StartChunkCleaner(cleanerCtx, cache, time.Hour)
+	}
+
 	// 连接 RabbitMQ (可选，用于消息队列)
 	rmq, err := rabbitmq.NewRabbitMQ(&cfg.RabbitMQ)
 	if err != nil {
@@ -99,7 +109,8 @@ func main() {
 	}
 
 	// 设置路由
-	r := apphttp.SetRouter(sqlDB, cache, rmq)
+	store := storage.NewFromConfig(cfg.ObjectStorage)
+	r := apphttp.SetRouter(sqlDB, cache, rmq, cfg.Server.AdminToken, store)
 	log.Printf("Server is running on port %d", cfg.Server.Port)
 	if err := r.Run(":" + strconv.Itoa(cfg.Server.Port)); err != nil {
 		log.Fatalf("Failed to run server: %v", err)
