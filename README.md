@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="picture/整体架构.png" alt="整体架构" width="720"/>
-</p>
-
 <h1 align="center">🎬 KirbyFeed</h1>
 
 <p align="center">
@@ -15,6 +11,85 @@
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat" alt="License"/>
 </p>
 
+```mermaid
+flowchart TB
+    subgraph Client["🖥️ 客户端"]
+        direction LR
+        Vue["Vue 3 前端"]
+        PM["Postman / 调试工具"]
+    end
+
+    subgraph API["⚙️ API 进程 · Gin"]
+        direction TB
+        Router["Gin Router / Handlers"]
+        subgraph MW["鉴权中间件"]
+            direction LR
+            JWT["JWTAuth · 强鉴权"]
+            Soft["SoftJWTAuth · 软鉴权（Feed 可匿名）"]
+        end
+        subgraph Biz["业务模块 internal/*"]
+            direction LR
+            Account["Account"]
+            Video["Video"]
+            Feed["Feed"]
+            Social["Social"]
+            LikeC["Like & Comment"]
+        end
+        SSE["SSE Hub 实时通知"]
+        Outbox["Outbox Poller"]
+    end
+
+    subgraph WK["🔧 Worker 进程 · cmd/worker"]
+        direction LR
+        LW["LikeWorker"]
+        CW["CommentWorker"]
+        SW["SocialWorker"]
+        PW["PopularityWorker"]
+    end
+
+    MQ{{"🐰 RabbitMQ · Topic Exchange + DLX"}}
+
+    subgraph ST["💾 存储与加速"]
+        direction LR
+        MySQL[("MySQL")]
+        Redis[("Redis · 可选<br/>Token / Feed / 热榜 / 详情缓存")]
+        OSS["文件存储<br/>OSS / 本地磁盘"]
+    end
+
+    Client -->|"HTTP / JSON"| Router
+    Router --> MW
+    MW --> Biz
+    Biz -->|"同步读写"| MySQL
+    Biz -.->|"Token / Feed / 热榜 / 详情缓存"| Redis
+    Biz -->|"视频 / 封面 / 头像"| OSS
+    Biz -->|"点赞 / 评论 / 关注 / 热度事件"| MQ
+    Outbox -.->|"可靠投递时间线事件"| MQ
+    MQ ==>|"异步消费"| WK
+    WK --> MySQL
+    WK -.-> Redis
+    WK -->|"生成通知"| SSE
+    SSE -.->|"SSE 实时推送"| Vue
+
+    classDef client fill:#E0F2FE,stroke:#0284C7,stroke-width:1.5px,color:#0C4A6E
+    classDef core fill:#EEF2FF,stroke:#6366F1,stroke-width:1.5px,color:#312E81
+    classDef work fill:#D1FAE5,stroke:#059669,stroke-width:1.5px,color:#064E3B
+    classDef store fill:#FEF3C7,stroke:#D97706,stroke-width:1.5px,color:#78350F
+    classDef bus fill:#FCE7F3,stroke:#DB2777,stroke-width:1.5px,color:#831843
+    class Vue,PM client
+    class Router,JWT,Soft,Account,Video,Feed,Social,LikeC,SSE,Outbox core
+    class LW,CW,SW,PW work
+    class MySQL,Redis,OSS store
+    class MQ bus
+    style Client fill:#F8FAFC,stroke:#CBD5E1
+    style API fill:#FAFAFF,stroke:#C7D2FE
+    style MW fill:#FFFFFF,stroke:#E2E8F0
+    style Biz fill:#FFFFFF,stroke:#E2E8F0
+    style WK fill:#F0FDF4,stroke:#A7F3D0
+    style ST fill:#FFFBEB,stroke:#FDE68A
+```
+
+<p align="center"><i>KirbyFeed 整体架构：API + Worker 双进程，Redis / RabbitMQ 均可降级运行不中断服务</i></p>
+
 ---
 
 ## 一句话介绍
@@ -22,8 +97,6 @@
 > 国内 Go 后端圈里，能同时把 **Feed 流、分片续传、实时通知、热榜、事件驱动异步化** 都做扎实的开源项目不多——这个项目就是其中之一。
 >
 > 它不是「Hello World 级别的 demo」，而是一套**从接口到 Worker、从缓存到降级、从部署到可观测**都按生产级思路打磨过的短视频信息流系统。拿来学习能吃透架构，拿来面试能讲出取舍，拿来二开能直接长出新业务。
-
-> 💡 想要更「全家桶」的版本？[LeoninCS/GCFeed](https://github.com/LeoninCS/GCFeed) 是更全面的视频 Feed 系统项目，业务能力覆盖更完整，建议一并围观。
 
 ---
 
